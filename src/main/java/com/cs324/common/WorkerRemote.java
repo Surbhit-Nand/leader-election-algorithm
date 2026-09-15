@@ -2,7 +2,6 @@ package com.cs324.common;
 
 import java.rmi.Remote;
 import java.rmi.RemoteException;
-import java.util.List;
 
 /**
  * RMI contract implemented by every Worker node.
