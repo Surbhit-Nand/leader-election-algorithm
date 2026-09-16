@@ -1,4 +1,4 @@
-# CS324 Assignment 1 (2026) — Distributed Worker Cluster
+# CS324 Assignment 1 (2026) - Distributed Worker Cluster
 
 ## First-Time Setup
 
@@ -67,7 +67,7 @@ git push origin <name>
 ---
 
 ## Packages
-- `common` — shared RMI interfaces + constants
-- `bootstrap` — Bootstrap Node
-- `worker` — Worker nodes (election + job execution)
-- `client` — Client GUI
+- `common` - shared RMI interfaces + constants
+- `bootstrap` - Bootstrap Node
+- `worker` - Worker nodes (election + job execution)
+- `client` - Client GUI
