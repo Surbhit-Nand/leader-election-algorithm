@@ -22,9 +22,12 @@ Build the project:
 mvn compile
 ```
 
+Run ClientApp.java by right clicking the file.
+
+
 ---
 
-## Every Time You Work On This
+## Every Time You Work On This (AFTER IMPLEMENTING WORKERS)
 
 Pull the latest changes first:
 ```
