@@ -16,7 +16,6 @@ import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * TODO: implement BootstrapRemote.
  * Keep the active-worker map thread-safe (ConcurrentHashMap is a good start)
  * since multiple workers may register/deregister concurrently.
  */

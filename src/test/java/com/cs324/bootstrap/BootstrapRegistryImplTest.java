@@ -13,10 +13,13 @@ import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
+import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BootstrapRegistryImplTest {
 
@@ -90,4 +93,61 @@ class BootstrapRegistryImplTest {
 
         unexportQuietly(worker1);
     }
+
+        @Test
+    void getActiveWorkerIdsIsEmptyWhenNoneRegistered() throws RemoteException {
+        assertTrue(bootstrap.getActiveWorkerIds().isEmpty(), "a fresh Bootstrap Node should have no active workers yet");
+    }
+ 
+    @Test
+    void getActiveWorkerIdsReflectsAllRegisteredWorkers() throws Exception {
+        FakeWorkerRemote worker1 = new FakeWorkerRemote(1);
+        registry.rebind("Worker1", worker1);
+        bootstrap.registerWorker(1, "localhost", TEST_RMI_PORT);
+        bootstrap.registerWorker(2, "localhost", TEST_RMI_PORT);
+ 
+        List<Integer> activeIds = bootstrap.getActiveWorkerIds();
+ 
+        assertEquals(2, activeIds.size(), "both registered workers should be reflected");
+        assertTrue(activeIds.contains(1), "worker 1 should be in the active list");
+        assertTrue(activeIds.contains(2), "worker 2 should be in the active list");
+ 
+        unexportQuietly(worker1);
+    }
+ 
+    @Test
+    void getActiveWorkerIdsExcludesDeregisteredWorkers() throws Exception {
+        FakeWorkerRemote worker1 = new FakeWorkerRemote(1);
+        registry.rebind("Worker1", worker1);
+        bootstrap.registerWorker(1, "localhost", TEST_RMI_PORT);
+        bootstrap.registerWorker(2, "localhost", TEST_RMI_PORT);
+ 
+        bootstrap.deregisterWorker(1);
+        List<Integer> activeIds = bootstrap.getActiveWorkerIds();
+ 
+        assertEquals(1, activeIds.size(), "only the non-deregistered worker should remain");
+        assertTrue(activeIds.contains(2), "worker 2 should still be active");
+ 
+        unexportQuietly(worker1);
+    }
+
+    @Test
+    void deregisterWorkerRemovesAnExistingWorker() throws RemoteException {
+        bootstrap.registerWorker(1, "localhost", TEST_RMI_PORT);
+        assertEquals(1, bootstrap.getActiveWorkerIds().size(), "worker should be registered before deregistering it");
+ 
+        bootstrap.deregisterWorker(1);
+ 
+        assertTrue(bootstrap.getActiveWorkerIds().isEmpty(), "the worker should no longer be active after deregistering");
+    }
+ 
+    @Test
+    void deregisteringAnUnknownWorkerDoesNotThrow() {
+        // 42 was never registered. Map.remove() on a missing key is a no-op,
+        // so this should complete quietly rather than error out.
+        assertDoesNotThrow(() -> bootstrap.deregisterWorker(42),
+                "deregistering an unknown worker id should not throw");
+    }
+
+
 }
