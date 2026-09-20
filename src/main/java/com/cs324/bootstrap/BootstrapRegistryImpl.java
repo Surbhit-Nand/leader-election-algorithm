@@ -1,10 +1,18 @@
 package com.cs324.bootstrap;
 
 import com.cs324.common.BootstrapRemote;
+import com.cs324.common.WorkerAddress;
+import com.cs324.common.WorkerRemote;
+
+import java.rmi.NotBoundException;
 import java.rmi.RemoteException;
+import java.rmi.registry.LocateRegistry;
+import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -14,26 +22,46 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class BootstrapRegistryImpl extends UnicastRemoteObject implements BootstrapRemote {
 
-    private final Map<Integer, String> activeWorkers = new ConcurrentHashMap<>();
+    private final Map<Integer, WorkerAddress> activeWorkers = new ConcurrentHashMap<>();
 
     public BootstrapRegistryImpl() throws RemoteException {
         super();
     }
 
     @Override
-    public Integer registerWorker(int workerId, String rmiHost, int rmiPort) throws RemoteException {
-        // TODO: pick a random existing active worker to return, then add this one
-        throw new UnsupportedOperationException("Not implemented yet");
+    public WorkerRemote registerWorker(int workerId, String rmiHost, int rmiPort) throws RemoteException {
+        List<Map.Entry<Integer, WorkerAddress>> snapshot = new ArrayList<>(activeWorkers.entrySet());
+
+        WorkerRemote peerStub = null;
+        Map.Entry<Integer, WorkerAddress> chosen = null;
+        if (!snapshot.isEmpty()) {
+            Random random = new Random();
+            chosen = snapshot.get(random.nextInt(snapshot.size()));
+        }
+        
+        if(chosen != null){
+            try {
+                Registry peerRegistry = LocateRegistry.getRegistry(chosen.getValue().getRmiHost(), chosen.getValue().getRmiPort());
+                peerStub = (WorkerRemote) peerRegistry.lookup("Worker" + chosen.getKey());
+                
+            } catch (NotBoundException e) {
+                throw new RemoteException("Failed to look up peer worker", e);
+            }
+        }
+
+        activeWorkers.put(workerId, new WorkerAddress(rmiHost, rmiPort));
+        return peerStub;
+        
     }
 
     @Override
     public void deregisterWorker(int workerId) throws RemoteException {
-        // TODO
+        activeWorkers.remove(workerId);
     }
 
     @Override
     public List<Integer> getActiveWorkerIds() throws RemoteException {
-        // TODO
-        throw new UnsupportedOperationException("Not implemented yet");
+        return new ArrayList<>(activeWorkers.keySet());
+        
     }
 }

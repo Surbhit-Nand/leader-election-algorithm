@@ -1,0 +1,67 @@
+package com.cs324.bootstrap;
+
+import com.cs324.common.WorkerRemote;
+
+import java.rmi.RemoteException;
+import java.rmi.server.UnicastRemoteObject;
+
+/**
+ * Test double for WorkerRemote.
+ * Only getId() actually matters for these tests — every other method
+ * is a no-op stub, just enough to satisfy the interface so this can be
+ * bound in a real RMI registry and looked up by BootstrapRegistryImpl.
+ */
+public class FakeWorkerRemote extends UnicastRemoteObject implements WorkerRemote {
+
+    private final int id;
+
+    public FakeWorkerRemote(int id) throws RemoteException {
+        super();
+        this.id = id;
+    }
+
+    @Override
+    public int getId() throws RemoteException {
+        return id;
+    }
+
+    @Override
+    public int getJobAllocationCounter() throws RemoteException {
+        return 0;
+    }
+
+    @Override
+    public boolean isActive() throws RemoteException {
+        return true;
+    }
+
+    @Override
+    public void receiveElectionMessage(int originId, int candidateId, int candidateJac, long messageId) throws RemoteException {
+        // not needed for these tests
+    }
+
+    @Override
+    public void receiveEchoMessage(long messageId, int fromWorkerId, int bestCandidateId, int bestCandidateJac) throws RemoteException {
+        // not needed for these tests
+    }
+
+    @Override
+    public void connectAsNeighbour(int newWorker, String rmiHost, int rmiPort) throws RemoteException {
+        // not needed for these tests
+    }
+
+    @Override
+    public void receiveCoordinatorMessage(int coordinatorId, long messageId) throws RemoteException {
+        // not needed for these tests
+    }
+
+    @Override
+    public void assignTask(int jobId, String jobType, Object payload) throws RemoteException {
+        // not needed for these tests
+    }
+
+    @Override
+    public void reportTaskResult(int jobId, int workerId, Object result) throws RemoteException {
+        // not needed for these tests
+    }
+}

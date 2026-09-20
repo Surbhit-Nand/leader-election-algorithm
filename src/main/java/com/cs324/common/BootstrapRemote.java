@@ -12,7 +12,7 @@ public interface BootstrapRemote extends Remote {
 
     // A worker registers itself and is returned an existing active worker
     // to randomly connect to (or null if it is the first node).
-    Integer registerWorker(int workerId, String rmiHost, int rmiPort) throws RemoteException;
+    WorkerRemote registerWorker(int workerId, String rmiHost, int rmiPort) throws RemoteException;
 
     void deregisterWorker(int workerId) throws RemoteException;
 
