@@ -19,6 +19,8 @@ public interface WorkerRemote extends Remote {
     // originId/messageId let the receiver detect and drop duplicates.
     void receiveElectionMessage(int originId, int candidateId, int candidateJac, long messageId) throws RemoteException;
 
+    void connectAsNeighbour(int newWorker, String rmiHost, int rmiPort) throws RemoteException;
+
     // Called by a neighbour to propagate the COORDINATOR result.
     void receiveCoordinatorMessage(int coordinatorId, long messageId) throws RemoteException;
 
