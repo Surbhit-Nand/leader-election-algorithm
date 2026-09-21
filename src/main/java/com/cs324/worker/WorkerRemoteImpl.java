@@ -41,6 +41,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
     @Override
     public boolean isActive() throws RemoteException {
+        
         return true; // TODO
     }
 

@@ -5,6 +5,8 @@ nbproject/private/
 nbbuild/
 nbdist/
 .nb-gradle/
-.vscode/
+# VS Code: share run/debug configs, keep machine-specific settings local
+.vscode/*
+!.vscode/launch.json
 *.log
 .DS_Store

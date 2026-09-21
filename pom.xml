@@ -23,7 +23,7 @@
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
-                <version>3.2.0</version>
+                <version>3.5.1</version>
                 <configuration>
                     <mainClass>${exec.mainClass}</mainClass>
                 </configuration>
@@ -35,4 +35,32 @@
             </plugin>
         </plugins>
     </build>
+    <!--
+        Convenience profiles: each one only sets the default main class and the
+        plain program arguments for that node. They are intentionally free of any
+        "%classpath" template so they behave the same for exec:java and exec:exec.
+        A command line -Dexec.mainClass / -Dexec.args always overrides a profile.
+    -->
+    <profiles>
+        <profile>
+            <id>client</id>
+            <properties>
+                <exec.mainClass>com.cs324.client.ClientApp</exec.mainClass>
+            </properties>
+        </profile>
+        <profile>
+            <id>bootstrap</id>
+            <properties>
+                <exec.mainClass>com.cs324.bootstrap.BootstrapNode</exec.mainClass>
+                <exec.args>1099</exec.args>
+            </properties>
+        </profile>
+        <profile>
+            <id>worker</id>
+            <properties>
+                <exec.mainClass>com.cs324.worker.WorkerNode</exec.mainClass>
+                <exec.args>1 3500 localhost 1099</exec.args>
+            </properties>
+        </profile>
+    </profiles>
 </project>
