@@ -55,8 +55,22 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     }
 
     @Override
-    public Object executeTask(String jobType, Object payload) throws RemoteException {
+    public void receiveEchoMessage(long messageId, int fromWorkerId, int bestCandidateId, int bestCandidateJac) throws RemoteException {
+        // TODO: propagate the reply once a subtree has finished
+    }
+
+    @Override
+    public void connectAsNeighbour(int newWorker, String rmiHost, int rmiPort) throws RemoteException {
+        // TODO: add the new worker to the local neighbour list
+    }
+
+    @Override
+    public void assignTask(int jobId, String jobType, Object payload) throws RemoteException {
         // TODO: dispatch to MAX / PRIMESUM / PRIMECOUNT logic on a worker thread
-        throw new UnsupportedOperationException("Not implemented yet");
+    }
+
+    @Override
+    public void reportTaskResult(int jobId, int workerId, Object result) throws RemoteException {
+        // TODO: callback when a task completes
     }
 }
