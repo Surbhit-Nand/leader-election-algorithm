@@ -101,3 +101,19 @@ These are settled interpretations of ambiguous spec points. Keep implementations
 - `bootstrap` - Bootstrap Node
 - `worker` - Worker nodes (election + job execution)
 - `client` - Client GUI
+
+## Updated GUI
+
+The client now has rounded panels, blue buttons, icons, and a job preview table.
+It supports manual input, numeric CSV loading, input validation, and clearing
+input without removing previous previews. `ClientApp.java` handles the interface
+and input; `ClientStyle.java` contains the styling helpers.
+
+The GUI currently validates and previews jobs only. Backend submission and
+computation results are still pending.
+
+Run the updated client:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=com.cs324.client.ClientApp"
+```
