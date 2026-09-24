@@ -76,21 +76,18 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
      * Initiates a new election wave from this node using a bitwise-packed unique message ID.
      */
     public synchronized long startElection() {
-        // High 32 bits = worker id, Low 32 bits = incrementing election counter
         long messageId = ((long) id << 32) | (electionCounter++);
         seenMessageIds.add(messageId);
 
         int currentJac = jobAllocationCounter.get();
         ElectionState election = new ElectionState(this.id, this.id, currentJac);
 
-        // All neighbours are pending children initially
         for (Integer neighborId : neighbours.keySet()) {
             election.pendingChildren.add(neighborId);
         }
 
         elections.put(messageId, election);
 
-        // Broadcast election message to all neighbours
         for (Map.Entry<Integer, WorkerRemote> entry : neighbours.entrySet()) {
             try {
                 entry.getValue().receiveElectionMessage(this.id, this.id, currentJac, messageId);
@@ -108,7 +105,6 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     @Override
     public void receiveElectionMessage(int originId, int candidateId, int candidateJac, long messageId) throws RemoteException {
         if (!seenMessageIds.add(messageId)) {
-            // Duplicate ELECTION: reply immediately to prevent deadlock
             ElectionState existing = elections.get(messageId);
             if (existing != null) {
                 try {
@@ -182,7 +178,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
 
         synchronized (election) {
-            if (election.bestCandidateJac < bestCandidateJac) {
+            if (bestCandidateJac < election.bestCandidateJac) {
                 election.bestCandidateId = bestCandidateId;
                 election.bestCandidateJac = bestCandidateJac;
             } else if (election.bestCandidateJac == bestCandidateJac) {
@@ -210,7 +206,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
         if (election.parentId == this.id) {
             this.currentCoordinatorId = election.bestCandidateId;
-            long coordMessageId = messageId + 1000000L; // Separate coordinator message ID space
+            long coordMessageId = messageId + 1000000L;
             for (Map.Entry<Integer, WorkerRemote> entry : neighbours.entrySet()) {
                 try {
                     entry.getValue().receiveCoordinatorMessage(election.bestCandidateId, coordMessageId);
