@@ -1,4 +1,4 @@
-package com.cs324.bootstrap;
+package com.cs324.test;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;

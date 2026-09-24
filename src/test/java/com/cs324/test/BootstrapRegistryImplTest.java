@@ -1,5 +1,6 @@
-package com.cs324.bootstrap;
+package com.cs324.test;
 
+import com.cs324.bootstrap.BootstrapRegistryImpl;
 import com.cs324.common.WorkerRemote;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;

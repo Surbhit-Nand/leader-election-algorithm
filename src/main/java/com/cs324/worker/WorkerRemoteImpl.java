@@ -3,6 +3,7 @@ package com.cs324.worker;
 import com.cs324.common.WorkerRemote;
 import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -20,9 +21,23 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemote {
 
+    private static class ElectionState{
+        int parentId;
+        int bestCandidateId;
+        int bestCandidateJac;
+
+        ElectionState(int id, int bid, int Jac){
+            parentId = id;
+            bestCandidateId = bid;
+            bestCandidateJac = Jac;
+        }
+    }
+
     private final int id;
     private volatile int jobAllocationCounter = 0;
+    private volatile int currentCoordinatorId = -1; // -1 = no known coordinator yet
     private final Set<Long> seenMessageIds = ConcurrentHashMap.newKeySet();
+    private final Map<Long, ElectionState> elections = new ConcurrentHashMap<>();
 
     public WorkerRemoteImpl(int id) throws RemoteException {
         super();
@@ -39,20 +54,44 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         return jobAllocationCounter;
     }
 
+    public int getCurrentCoordinatorId() {
+        return currentCoordinatorId;
+    }
+
     @Override
     public boolean isActive() throws RemoteException {
-        
-        return true; // TODO
+        return true;
     }
 
     @Override
     public void receiveElectionMessage(int originId, int candidateId, int candidateJac, long messageId) throws RemoteException {
-        // TODO: check seenMessageIds first, then compare JAC / ID and forward
+        if(!seenMessageIds.add(messageId)){
+            return;
+        }
+        ElectionState election = new ElectionState(originId, candidateId, candidateJac);
+        if (this.jobAllocationCounter < candidateJac) {
+            election.bestCandidateId = this.id; 
+            election.bestCandidateJac = this.jobAllocationCounter;
+        }
+        else if (this.jobAllocationCounter > candidateJac) {
+
+        }
+        else {
+            if (this.id > candidateId) {
+                election.bestCandidateId = this.id; 
+                election.bestCandidateJac = this.jobAllocationCounter;
+            } else {
+            }
+        }
+        elections.put(messageId, election);
     }
 
     @Override
     public void receiveCoordinatorMessage(int coordinatorId, long messageId) throws RemoteException {
-        // TODO: check seenMessageIds first, then record coordinator and forward
+        if (!seenMessageIds.add(messageId)) {
+            return;
+        }
+        this.currentCoordinatorId = coordinatorId;
     }
 
     @Override
