@@ -37,6 +37,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
     private final int id;
     private final AtomicInteger jobAllocationCounter = new AtomicInteger(0);
+    private long electionCounter = 0; // Guaranteed unique incrementing counter for election IDs
     private volatile int currentCoordinatorId = -1; // -1 = no known coordinator yet
     private final Set<Long> seenMessageIds = ConcurrentHashMap.newKeySet();
     private final Set<Long> seenCoordinatorMessageIds = ConcurrentHashMap.newKeySet();
@@ -72,10 +73,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     }
 
     /**
-     * Initiates a new election wave from this node.
+     * Initiates a new election wave from this node using a bitwise-packed unique message ID.
      */
     public synchronized long startElection() {
-        long messageId = System.currentTimeMillis() * 1000L + id;
+        // High 32 bits = worker id, Low 32 bits = incrementing election counter
+        long messageId = ((long) id << 32) | (electionCounter++);
         seenMessageIds.add(messageId);
 
         int currentJac = jobAllocationCounter.get();
@@ -311,7 +313,6 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         List<Integer> list = new ArrayList<>();
         if (payload instanceof int[]) {
             int[] arr = (int[]) payload;
-            // Only expand as a range for prime jobs if length == 2; MAX treats length 2 strictly as data
             if (arr.length == 2 && !"MAX".equalsIgnoreCase(jobType)) {
                 int start = arr[0];
                 int end = arr[1];
