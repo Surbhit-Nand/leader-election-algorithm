@@ -174,7 +174,34 @@ input without removing previous previews. `ClientApp.java` handles the interface
 and input; `ClientStyle.java` contains the styling helpers.
 
 The GUI currently validates and previews jobs only. Backend submission and
-computation results are still pending.
+displaying computation results are still pending.
+
+## Computation
+
+`WorkerTaskCalculator` handles three calculations:
+
+- `MAX`: finds the largest number.
+- `PRIMESUM`: adds the prime numbers.
+- `PRIMECOUNT`: counts prime numbers, including duplicates.
+
+```java
+WorkerTaskCalculator.calculate("MAX", new int[]{3, 7, 12, 45}); // 45
+WorkerTaskCalculator.calculate("PRIMESUM", new int[]{1, 10}); // 17
+WorkerTaskCalculator.calculate("PRIMECOUNT", new Integer[]{2, 4, 5}); // 2
+```
+
+For either prime operation, a two-value `int[]` means an inclusive range.
+Use `Integer[]` for a list of values. MAX always treats its input as a list.
+MAX and PRIMECOUNT return `Integer`; PRIMESUM returns `Long`.
+
+The calculator matches the worker's input formats but is not connected to worker
+execution yet.
+
+Run its tests:
+
+```powershell
+mvn "-Dtest=WorkerTaskCalculatorTest" test
+```
 
 Run the updated client:
 
