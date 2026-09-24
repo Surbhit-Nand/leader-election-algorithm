@@ -16,9 +16,9 @@ import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Covers the "a new worker joins through an existing active worker" handoff -
@@ -94,26 +94,17 @@ class WorkerJoinTest {
     }
 
     @Test
-    void registeringWhileTheChosenPeerIsNotBoundFailsAndAlsoDropsTheNewWorker() throws Exception {
+    void registeringWhileTheChosenPeerIsNotBoundSkipsStalePeerAndKeepsNewWorker() throws Exception {
         // Worker 1 is in the Bootstrap's active list but was never bound in the
-        // registry - e.g. it crashed, or bound under a different name. The
-        // Bootstrap still considers it a candidate peer.
+        // registry - e.g. it crashed, or bound under a different name.
         bootstrap.registerWorker(1, HOST, TEST_RMI_PORT);
 
-        // Worker 2 registers, the Bootstrap picks worker 1, and the lookup fails.
-        assertThrows(RemoteException.class,
-                () -> bootstrap.registerWorker(2, HOST, TEST_RMI_PORT),
-                "an unreachable peer should surface as a RemoteException");
-
-        // KNOWN GAP in BootstrapRegistryImpl: the lookup throws *before*
-        // activeWorkers.put(workerId, ...) runs, so the joining worker is never
-        // added to the active list either. One stale entry therefore blocks new
-        // workers from joining at all, and the Bootstrap gives no hint why.
-        //
-        // If you change registerWorker so a worker is still recorded (or so the
-        // peer is simply skipped when it cannot be resolved), flip this assertion
-        // to assertTrue and this test becomes the regression guard for the fix.
-        assertFalse(bootstrap.getActiveWorkerIds().contains(2),
-                "current behaviour: the failed join also drops worker 2 from the active list");
+        // Worker 2 registers: the stale peer is skipped (and pruned), the join
+        // succeeds with no live peer, and the newcomer is still recorded.
+        WorkerRemote peer = assertDoesNotThrow(() -> bootstrap.registerWorker(2, HOST, TEST_RMI_PORT),
+                "a stale peer must be skipped, not fail the whole join");
+        assertNull(peer, "with only a stale peer available there is no live peer to hand out");
+        assertTrue(bootstrap.getActiveWorkerIds().contains(2),
+                "fixed behaviour: the failed peer lookup must not drop worker 2 from the active list");
     }
 }
