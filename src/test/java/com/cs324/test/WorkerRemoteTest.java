@@ -7,6 +7,7 @@ import java.rmi.NoSuchObjectException;
 import java.rmi.server.UnicastRemoteObject;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cs324.worker.WorkerRemoteImpl;
 
@@ -68,5 +69,27 @@ class WorkerRemoteImplTest {
 
         assertEquals(3, worker.getCurrentCoordinatorId(),
                 "a new messageId should update the coordinator normally, independent of earlier duplicates");
+    }
+
+    @Test
+    void aFreshWorkerHasItsOwnIdAndNoKnownCoordinator() throws Exception {
+        worker = new WorkerRemoteImpl(9);
+
+        assertEquals(9, worker.getId(), "a worker should report the id it was constructed with");
+        assertEquals(-1, worker.getCurrentCoordinatorId(),
+                "a worker that has seen no COORDINATOR message must not claim to know a coordinator");
+
+        // The election rule compares JAC values, so the starting point matters:
+        // every worker must begin from the same baseline of zero assignments.
+        assertEquals(0, worker.getJobAllocationCounter(),
+                "a worker that has coordinated nothing should start with a Job Allocation Counter of zero");
+    }
+
+    @Test
+    void aFreshWorkerReportsItselfActive() throws Exception {
+        worker = new WorkerRemoteImpl(4);
+
+        assertTrue(worker.isActive(),
+                "a running worker should report itself as active so it can be discovered and handed out as a peer");
     }
 }
