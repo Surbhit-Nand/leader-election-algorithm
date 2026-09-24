@@ -10,6 +10,7 @@ import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -29,28 +30,32 @@ public class BootstrapRegistryImpl extends UnicastRemoteObject implements Bootst
 
     @Override
     public WorkerRemote registerWorker(int workerId, String rmiHost, int rmiPort) throws RemoteException {
+        if (activeWorkers.containsKey(workerId)) {
+            throw new RemoteException("Duplicate worker id " + workerId + " - already registered");
+        }
+
+        // Shuffle so the peer is random; skip stale entries instead of failing
+        // the whole join when one peer has crashed or was never bound.
         List<Map.Entry<Integer, WorkerAddress>> snapshot = new ArrayList<>(activeWorkers.entrySet());
+        Collections.shuffle(snapshot, new Random());
 
         WorkerRemote peerStub = null;
-        Map.Entry<Integer, WorkerAddress> chosen = null;
-        if (!snapshot.isEmpty()) {
-            Random random = new Random();
-            chosen = snapshot.get(random.nextInt(snapshot.size()));
-        }
-        
-        if(chosen != null){
+        for (Map.Entry<Integer, WorkerAddress> candidate : snapshot) {
             try {
-                Registry peerRegistry = LocateRegistry.getRegistry(chosen.getValue().getRmiHost(), chosen.getValue().getRmiPort());
-                peerStub = (WorkerRemote) peerRegistry.lookup("Worker" + chosen.getKey());
-                
+                Registry peerRegistry = LocateRegistry.getRegistry(
+                        candidate.getValue().getRmiHost(), candidate.getValue().getRmiPort());
+                peerStub = (WorkerRemote) peerRegistry.lookup("Worker" + candidate.getKey());
+                break; // first live peer wins
             } catch (NotBoundException e) {
-                throw new RemoteException("Failed to look up peer worker", e);
+                // Stale entry: prune it so it stops blocking future joins.
+                activeWorkers.remove(candidate.getKey());
+            } catch (RemoteException e) {
+                // Peer unreachable right now: try the next candidate.
             }
         }
 
         activeWorkers.put(workerId, new WorkerAddress(rmiHost, rmiPort));
         return peerStub;
-        
     }
 
     @Override
@@ -62,5 +67,10 @@ public class BootstrapRegistryImpl extends UnicastRemoteObject implements Bootst
     public List<Integer> getActiveWorkerIds() throws RemoteException {
         return new ArrayList<>(activeWorkers.keySet());
         
+    }
+
+    @Override
+    public WorkerAddress getWorkerAddress(int workerId) throws RemoteException {
+        return activeWorkers.get(workerId);
     }
 }

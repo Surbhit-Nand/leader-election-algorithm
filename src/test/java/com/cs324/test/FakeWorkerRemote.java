@@ -1,4 +1,4 @@
-package com.cs324.bootstrap;
+package com.cs324.test;
 
 import com.cs324.common.WorkerRemote;
 

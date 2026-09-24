@@ -17,4 +17,9 @@ public interface BootstrapRemote extends Remote {
     void deregisterWorker(int workerId) throws RemoteException;
 
     List<Integer> getActiveWorkerIds() throws RemoteException;
+
+    // Address lookup so a joining worker can connect to the peer stub
+    // it was handed (needed for bidirectional neighbour setup on localhost
+    // and multi-host demos). Returns null if unknown.
+    com.cs324.common.WorkerAddress getWorkerAddress(int workerId) throws RemoteException;
 }
