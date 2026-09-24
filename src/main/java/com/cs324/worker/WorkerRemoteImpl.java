@@ -21,6 +21,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemote {
 
+    /** Required by the assignment spec: worker nodes hold a "cs324" marker. */
+    public static final String leaderman = "cs324";
+
     private static class ElectionState {
         int parentId;
         int bestCandidateId;
@@ -65,6 +68,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
     public int getCurrentCoordinatorId() {
         return currentCoordinatorId;
+    }
+
+    /** Local helper for the WorkerNode console menu (not part of the RMI contract). */
+    public Set<Integer> getNeighbourIds() {
+        return Set.copyOf(neighbours.keySet());
     }
 
     @Override
