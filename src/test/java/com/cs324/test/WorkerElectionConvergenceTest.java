@@ -23,8 +23,8 @@ import static org.junit.jupiter.api.Assertions.fail;
  * Step 5 of the worker test plan: the election end to end.
  *
  * Everything before this tests one hop. This drives a real multi-hop election
- * across three workers in the same JVM, talking over RMI, and checks the two
- * things the assignment actually asks for:
+ * across a whole worker graph in the same JVM, talking over RMI, and checks the
+ * two things the assignment actually asks for:
  *
  *   - every reachable worker agrees on ONE coordinator, and
  *   - the winner is lowest JAC, with ties broken by highest worker id.
@@ -34,6 +34,10 @@ import static org.junit.jupiter.api.Assertions.fail;
  * silently dropped instead of answered, those two would wait for each other
  * forever. The timeout inside awaitAgreement() is what turns that deadlock into
  * a clear failure instead of a hung test run.
+ *
+ * The same properties are then re-checked on a five-worker graph, which puts
+ * the cycle and a two-worker branch on the same node. See
+ * {@link #fullElectionConvergesAcrossMixedFiveWorkerTopology()}.
  */
 class WorkerElectionConvergenceTest {
 
@@ -46,6 +50,8 @@ class WorkerElectionConvergenceTest {
     private WorkerRemoteImpl w1;
     private WorkerRemoteImpl w2;
     private WorkerRemoteImpl w3;
+    private WorkerRemoteImpl w4;
+    private WorkerRemoteImpl w5;
 
     @BeforeAll
     static void startRegistry() throws RemoteException {
@@ -62,10 +68,14 @@ class WorkerElectionConvergenceTest {
         w1 = new WorkerRemoteImpl(1);
         w2 = new WorkerRemoteImpl(2);
         w3 = new WorkerRemoteImpl(3);
+        w4 = new WorkerRemoteImpl(4);
+        w5 = new WorkerRemoteImpl(5);
 
         registry.rebind("Worker1", w1);
         registry.rebind("Worker2", w2);
         registry.rebind("Worker3", w3);
+        registry.rebind("Worker4", w4);
+        registry.rebind("Worker5", w5);
     }
 
     @AfterEach
@@ -76,6 +86,8 @@ class WorkerElectionConvergenceTest {
         unexportQuietly(w1);
         unexportQuietly(w2);
         unexportQuietly(w3);
+        unexportQuietly(w4);
+        unexportQuietly(w5);
     }
 
     private void unexportQuietly(Remote remoteObject) {
@@ -94,6 +106,8 @@ class WorkerElectionConvergenceTest {
             case 1 -> w1;
             case 2 -> w2;
             case 3 -> w3;
+            case 4 -> w4;
+            case 5 -> w5;
             default -> throw new IllegalArgumentException("unknown worker " + id);
         };
     }
@@ -121,6 +135,30 @@ class WorkerElectionConvergenceTest {
     }
 
     /**
+     * A triangle on 1-2-3 with a two-worker tail hanging off worker 3:
+     * 1<->2, 1<->3, 2<->3, 3<->4, 4<->5.
+     *
+     * This is the only shape in the file where the cycle and the dead ends sit
+     * on opposite sides of the same node. Worker 3 forwards the election both
+     * backwards into the triangle and forwards into the tail, so the winning
+     * candidate has to be carried into a branch whose members are the strongest
+     * in the graph - and the two rules (lowest JAC first, highest id second) have
+     * to be applied to candidates that never met each other.
+     */
+    private void wireTriangleWithTwoWorkerTail() throws Exception {
+        connect(1, 2);
+        connect(2, 1);
+        connect(1, 3);
+        connect(3, 1);
+        connect(2, 3);
+        connect(3, 2);
+        connect(3, 4);
+        connect(4, 3);
+        connect(4, 5);
+        connect(5, 4);
+    }
+
+    /**
      * Gives a worker a starting Job Allocation Counter.
      *
      * Reflection is used deliberately: there is no public way to arrange JAC
@@ -134,13 +172,32 @@ class WorkerElectionConvergenceTest {
         ((AtomicInteger) field.get(worker)).set(value);
     }
 
+    /** Polls the three workers wired by the triangle/chain helpers. */
     private void awaitAgreement(int expectedCoordinatorId) throws Exception {
+        awaitAgreement(expectedCoordinatorId, w1, w2, w3);
+    }
+
+    /**
+     * Polls every supplied worker until they all report the expected
+     * coordinator.
+     *
+     * The participating set is a parameter rather than a fixed trio so a
+     * topology of any size can reuse the same convergence check. Voting is
+     * asynchronous, so a single read can catch a worker mid-flight; keep
+     * polling until the deadline instead of reading once and trusting it.
+     */
+    private void awaitAgreement(int expectedCoordinatorId, WorkerRemoteImpl... participants) throws Exception {
         long deadline = System.currentTimeMillis() + CONVERGENCE_TIMEOUT_MS;
 
         while (System.currentTimeMillis() < deadline) {
-            if (w1.getCurrentCoordinatorId() == expectedCoordinatorId
-                    && w2.getCurrentCoordinatorId() == expectedCoordinatorId
-                    && w3.getCurrentCoordinatorId() == expectedCoordinatorId) {
+            boolean agreed = true;
+            for (WorkerRemoteImpl participant : participants) {
+                if (participant.getCurrentCoordinatorId() != expectedCoordinatorId) {
+                    agreed = false;
+                    break;
+                }
+            }
+            if (agreed) {
                 return;
             }
             Thread.sleep(20);
@@ -148,9 +205,21 @@ class WorkerElectionConvergenceTest {
 
         fail("the election did not converge on coordinator " + expectedCoordinatorId + " within "
                 + CONVERGENCE_TIMEOUT_MS + "ms - if the workers are stuck at -1 or disagree, the echo phase never "
-                + "terminated (a duplicate that was dropped instead of answered does exactly this). Got: w1="
-                + w1.getCurrentCoordinatorId() + ", w2=" + w2.getCurrentCoordinatorId()
-                + ", w3=" + w3.getCurrentCoordinatorId());
+                + "terminated (a duplicate that was dropped instead of answered does exactly this). Got: "
+                + describe(participants));
+    }
+
+    /** Renders "w1=3, w2=5, ..." for the failure message. */
+    private String describe(WorkerRemoteImpl... participants) throws RemoteException {
+        StringBuilder rendered = new StringBuilder();
+        for (WorkerRemoteImpl participant : participants) {
+            if (rendered.length() > 0) {
+                rendered.append(", ");
+            }
+            rendered.append("w").append(participant.getId())
+                    .append("=").append(participant.getCurrentCoordinatorId());
+        }
+        return rendered.toString();
     }
 
     @Test
@@ -216,5 +285,29 @@ class WorkerElectionConvergenceTest {
 
         assertEquals(3, w2.getCurrentCoordinatorId(),
                 "a new election must be applied normally rather than discarded as a repeat");
+    }
+
+    @Test
+    void fullElectionConvergesAcrossMixedFiveWorkerTopology() throws Exception {
+        wireTriangleWithTwoWorkerTail();
+
+        seedJobAllocationCounter(w1, 4);
+        seedJobAllocationCounter(w2, 2);
+        seedJobAllocationCounter(w3, 3);
+        seedJobAllocationCounter(w4, 1);
+        seedJobAllocationCounter(w5, 1);
+
+        // Worker 2 is neither the origin of the graph nor anywhere near the
+        // winner, so the ELECTION has to travel the triangle and then out along
+        // the tail before the winner is even known.
+        w2.startElection();
+
+        // Workers 4 and 5 share the lowest JAC in the graph at 1, so the JAC
+        // rule eliminates workers 1, 2 and 3 outright, and the id rule then
+        // picks 5 over 4. Crucially, worker 5 is a leaf on the far side of the
+        // graph: its own JAC is the only thing that puts it ahead of a candidate
+        // that never reaches it directly, so a propagation bug that stops at the
+        // branch point (worker 3) shows up as worker 5 never winning.
+        awaitAgreement(5, w1, w2, w3, w4, w5);
     }
 }
