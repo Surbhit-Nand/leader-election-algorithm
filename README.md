@@ -185,17 +185,28 @@ displaying computation results are still pending.
 - `PRIMECOUNT`: counts prime numbers, including duplicates.
 
 ```java
+import com.cs324.worker.WorkerTaskCalculator;
+import com.cs324.worker.WorkerTaskCalculator.PrimeRange;
+
 WorkerTaskCalculator.calculate("MAX", new int[]{3, 7, 12, 45}); // 45
-WorkerTaskCalculator.calculate("PRIMESUM", new int[]{1, 10}); // 17
-WorkerTaskCalculator.calculate("PRIMECOUNT", new Integer[]{2, 4, 5}); // 2
+WorkerTaskCalculator.calculate("PRIMESUM", new PrimeRange(1, 10)); // 17
+WorkerTaskCalculator.calculate("PRIMECOUNT", new int[]{2, 7}); // list: 2
+WorkerTaskCalculator.calculate("PRIMECOUNT", new PrimeRange(2, 7)); // range: 4
 ```
 
-For either prime operation, a two-value `int[]` means an inclusive range.
-Use `Integer[]` for a list of values. MAX always treats its input as a list.
+Arrays (`int[]` or `Integer[]`) and collections of `Integer` always mean lists,
+even with only two values. Use `PrimeRange(start, end)` for an inclusive range
+in either prime operation. MAX accepts lists only.
 MAX and PRIMECOUNT return `Integer`; PRIMESUM returns `Long`.
 
-The calculator matches the worker's input formats but is not connected to worker
-execution yet.
+Invalid inputs, null entries and reversed ranges raise `IllegalArgumentException`.
+Empty prime lists return zero; an empty MAX list is rejected. Use 32-bit integers;
+decimal values and `long` inputs are rejected rather than silently converted.
+Very wide ranges can still be slow.
+
+The calculator is not connected to worker execution yet. Its explicit range format
+replaces the worker's old two-value-array rule; future integration must update
+range payloads to `PrimeRange`.
 
 Run its tests:
 

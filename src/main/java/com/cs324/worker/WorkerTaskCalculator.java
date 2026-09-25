@@ -2,24 +2,33 @@ package com.cs324.worker;
 
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Objects;
+import java.io.Serializable;
 import java.util.stream.IntStream;
 
-/** Stateless calculations using the worker's existing payload and result contract. */
+/** Standalone calculations with explicit list and range payloads. */
 public final class WorkerTaskCalculator {
     private WorkerTaskCalculator() {}
 
+    /** Inclusive prime range; serializable for future worker integration. */
+    public record PrimeRange(int start, int end) implements Serializable {
+        public PrimeRange {
+            if (start > end) {
+                throw new IllegalArgumentException("Range start must not exceed end.");
+            }
+        }
+    }
+
     /**
      * Case-insensitive operations; MAX/count return Integer and sum returns Long.
-     * Two-element int arrays are inclusive ranges for both prime operations.
-     * Other int arrays, Integer arrays and numeric collections are lists.
-     * Null/unsupported payloads are empty; null boxed entries and nonnumeric
-     * collection entries are ignored. Numbers use intValue(), as in the worker.
-     * Empty inputs and reversed ranges return zero.
+     * int arrays, Integer arrays and collections of Integer are always lists.
+     * PrimeRange explicitly selects an inclusive range for either prime operation.
+     * Invalid payloads/elements and empty MAX lists throw IllegalArgumentException.
+     * Empty prime lists return zero. No numeric narrowing conversions are performed.
      */
     public static Number calculate(String jobType, Object payload) {
         if ("MAX".equalsIgnoreCase(jobType)) {
-            return numbers(jobType, payload).max().orElse(0);
+            return numbers(jobType, payload).max()
+                    .orElseThrow(() -> new IllegalArgumentException("MAX requires at least one value."));
         }
         if ("PRIMESUM".equalsIgnoreCase(jobType)) {
             return numbers(jobType, payload).filter(WorkerTaskCalculator::isPrime)
@@ -33,21 +42,30 @@ public final class WorkerTaskCalculator {
     }
 
     private static IntStream numbers(String jobType, Object payload) {
-        if (payload instanceof int[] values) {
-            if (values.length == 2 && !"MAX".equalsIgnoreCase(jobType)) {
-                // Avoid allocating the range or overflowing its upper endpoint.
-                return IntStream.rangeClosed(values[0], values[1]);
+        if (payload instanceof PrimeRange range) {
+            if ("MAX".equalsIgnoreCase(jobType)) {
+                throw new IllegalArgumentException("MAX requires a list, not a prime range.");
             }
+            // Negative numbers and 0/1 cannot be prime; skip them without iterating.
+            return IntStream.rangeClosed(Math.max(2, range.start()), range.end());
+        }
+        if (payload instanceof int[] values) {
             return Arrays.stream(values);
         }
         if (payload instanceof Integer[] values) {
-            return Arrays.stream(values).filter(Objects::nonNull).mapToInt(Integer::intValue);
+            return Arrays.stream(values).mapToInt(WorkerTaskCalculator::requireInteger);
         }
         if (payload instanceof Collection<?> values) {
-            return values.stream().filter(Number.class::isInstance)
-                    .mapToInt(value -> ((Number) value).intValue());
+            return values.stream().mapToInt(WorkerTaskCalculator::requireInteger);
         }
-        return IntStream.empty();
+        throw new IllegalArgumentException("Payload must be int[], Integer[], a collection of Integer, or PrimeRange.");
+    }
+
+    private static int requireInteger(Object value) {
+        if (value instanceof Integer integer) {
+            return integer;
+        }
+        throw new IllegalArgumentException("List entries must be non-null Integer values.");
     }
 
     /** Exact primality check without multiplication overflow. */
