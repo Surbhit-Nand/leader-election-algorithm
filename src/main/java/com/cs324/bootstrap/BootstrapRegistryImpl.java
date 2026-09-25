@@ -30,31 +30,40 @@ public class BootstrapRegistryImpl extends UnicastRemoteObject implements Bootst
 
     @Override
     public WorkerRemote registerWorker(int workerId, String rmiHost, int rmiPort) throws RemoteException {
-        if (activeWorkers.containsKey(workerId)) {
-            throw new RemoteException("Duplicate worker id " + workerId + " - already registered");
-        }
-
-        // Shuffle so the peer is random; skip stale entries instead of failing
-        // the whole join when one peer has crashed or was never bound.
+        // Copy workers before picking a peer, so the newcomer is never handed itself. If removed, a worker could be told to connect to itself.
         List<Map.Entry<Integer, WorkerAddress>> snapshot = new ArrayList<>(activeWorkers.entrySet());
+        // Randomise the order so the peer is random. If removed, every newcomer joins via the same peer and it becomes a bottleneck.
         Collections.shuffle(snapshot, new Random());
 
+        // The peer we will hand back (null = first worker). If removed, there is nowhere to store the chosen peer.
         WorkerRemote peerStub = null;
+        // Try each candidate until one answers. If removed, joining fails whenever the first candidate is dead.
         for (Map.Entry<Integer, WorkerAddress> candidate : snapshot) {
             try {
+                // Contact the candidate's registry. If removed, we can never find any peer.
                 Registry peerRegistry = LocateRegistry.getRegistry(
                         candidate.getValue().getRmiHost(), candidate.getValue().getRmiPort());
+                // Look up the peer worker. If removed, we hand back nothing and the newcomer stays isolated.
                 peerStub = (WorkerRemote) peerRegistry.lookup("Worker" + candidate.getKey());
                 break; // first live peer wins
             } catch (NotBoundException e) {
                 // Stale entry: prune it so it stops blocking future joins.
-                activeWorkers.remove(candidate.getKey());
+                // Remove only if unchanged (key+value match). If removed, dead entries pile up and every join scans garbage.
+                activeWorkers.remove(candidate.getKey(), candidate.getValue());
             } catch (RemoteException e) {
                 // Peer unreachable right now: try the next candidate.
             }
         }
 
-        activeWorkers.put(workerId, new WorkerAddress(rmiHost, rmiPort));
+        // Group 6: atomic insert. The old containsKey()+put() pair allowed two
+        // concurrent registerWorker(sameId) calls to both succeed (lost update);
+        // putIfAbsent makes duplicate detection atomic without changing semantics.
+        // Insert only if the ID is free; returns the existing entry otherwise. If removed (plain put), two workers with the same ID both succeed and the cluster breaks.
+        WorkerAddress prev = activeWorkers.putIfAbsent(workerId, new WorkerAddress(rmiHost, rmiPort));
+        // ID was already taken: reject. If removed, duplicates are silently accepted.
+        if (prev != null) {
+            throw new RemoteException("Duplicate worker id " + workerId + " - already registered");
+        }
         return peerStub;
     }
 
