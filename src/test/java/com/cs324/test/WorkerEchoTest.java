@@ -30,7 +30,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * Termination is therefore an exact, local condition ("every child replied"),
  * not a timeout. These tests pin that down, plus the once-only guard that stops
- * a repeated echo from being propagated twice.
+ * a repeated echo from being propagated twice, and the case where a node has
+ * more than one child and has to wait for all of them.
  */
 class WorkerEchoTest {
 
@@ -43,6 +44,7 @@ class WorkerEchoTest {
     private WorkerRemoteImpl worker;      // id 1 - the node under test
     private RecordingWorkerRemote parent; // id 2 - who the echo must be sent up to
     private RecordingWorkerRemote child;  // id 3 - who owes this node an echo
+    private RecordingWorkerRemote otherChild; // id 4 - a second child, for the two-child case
 
     @BeforeAll
     static void startRegistry() throws RemoteException {
@@ -75,6 +77,7 @@ class WorkerEchoTest {
         unexportQuietly(worker);
         unexportQuietly(parent);
         unexportQuietly(child);
+        unexportQuietly(otherChild);
     }
 
     private void unexportQuietly(Remote remoteObject) {
@@ -122,6 +125,33 @@ class WorkerEchoTest {
         assertEquals(1L, countOf(parent.calls(), "echo|"),
                 "a node must report upward exactly once; a duplicate echo must not trigger a second propagation; "
                         + "recorded: " + parent.calls());
+    }
+
+    @Test
+    void waitsForAllChildrenBeforeEchoingToParent() throws Exception {
+        otherChild = new RecordingWorkerRemote(4);
+        registry.rebind("Worker4", otherChild);
+        worker.connectAsNeighbour(4, HOST, TEST_RMI_PORT);
+
+        receiveElectionFromParent();
+
+        // Only the first of two children has answered so far.
+        worker.receiveEchoMessage(ELECTION_ID, 3, 3, 0);
+
+        assertEquals(0L, countOf(parent.calls(), "echo|"),
+                "with a child still owing an echo this node must not report upward yet - a premature echo tells the "
+                        + "parent this subtree is finished, so it can decide a winner without ever hearing from the "
+                        + "other child, and the highest id in that subtree is lost; recorded: " + parent.calls());
+
+        // The last child answers, so the subtree is complete.
+        worker.receiveEchoMessage(ELECTION_ID, 4, 4, 0);
+
+        assertEquals(1L, countOf(parent.calls(), "echo|"),
+                "once the last child has answered, the running best candidate must go up exactly once; recorded: "
+                        + parent.calls());
+        assertTrue(parent.receivedEcho(1, ELECTION_ID),
+                "the echo has to name this node and this election, or the parent cannot match it to the election it "
+                        + "is waiting on; recorded: " + parent.calls());
     }
 
     @Test

@@ -177,6 +177,23 @@ class WorkerElectionConvergenceTest {
     }
 
     @Test
+    void whenLowestJacIsTiedTheHigherWorkerIdWins() throws Exception {
+        wireTriangle();
+        seedJobAllocationCounter(w1, 2);
+        seedJobAllocationCounter(w2, 1);
+        seedJobAllocationCounter(w3, 1);
+
+        w1.startElection();
+
+        // Workers 2 and 3 share the lowest JAC, so the election has to settle
+        // that tie the same way it always does - on the higher id. This is the
+        // only test where the two rules are applied in sequence on the same
+        // election: the JAC decides which ids are even in the running, then the
+        // id picks the winner among them.
+        awaitAgreement(3);
+    }
+
+    @Test
     void aChainTopologyWithNoCycleAlsoConverges() throws Exception {
         wireChain();
 
