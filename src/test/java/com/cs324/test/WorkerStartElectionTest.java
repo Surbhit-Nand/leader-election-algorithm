@@ -1,12 +1,17 @@
 package com.cs324.test;
 
 import com.cs324.worker.WorkerRemoteImpl;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.rmi.NoSuchObjectException;
 import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.rmi.registry.LocateRegistry;
+import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.HashSet;
 import java.util.Map;
@@ -28,21 +33,45 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * A lone worker has no neighbours, so there is nothing to wait for: the election
  * must resolve immediately to itself.
  *
- * These tests need no registry or peers - startElection on a worker with no
- * neighbours is entirely local.
+ * Most of these need no registry or peers - startElection on a worker with no
+ * neighbours is entirely local. The one exception is the fan-out test, which
+ * needs a real registry to hand out RMI stubs for the neighbours, because
+ * "did the neighbour really receive it over RMI?" is the whole point of it.
  */
 class WorkerStartElectionTest {
+
+    private static final int TEST_RMI_PORT = 19807;
+    private static final String HOST = "localhost";
 
     /** How many back-to-back elections to start when checking that ids do not repeat. */
     private static final int RAPID_ELECTIONS = 100;
 
+    private static Registry registry;
+
     private WorkerRemoteImpl worker;
     private WorkerRemoteImpl otherWorker;
+    private RecordingWorkerRemote neighbourTwo;   // id 2 - records what worker 1 sends it
+    private RecordingWorkerRemote neighbourThree; // id 3 - records what worker 1 sends it
+
+    @BeforeAll
+    static void startRegistry() throws RemoteException {
+        registry = LocateRegistry.createRegistry(TEST_RMI_PORT);
+    }
+
+    @AfterAll
+    static void stopRegistry() throws Exception {
+        UnicastRemoteObject.unexportObject(registry, true);
+    }
 
     @AfterEach
     void tearDown() throws Exception {
+        for (String name : registry.list()) {
+            registry.unbind(name);
+        }
         unexportQuietly(worker);
         unexportQuietly(otherWorker);
+        unexportQuietly(neighbourTwo);
+        unexportQuietly(neighbourThree);
     }
 
     private void unexportQuietly(Remote remoteObject) {
@@ -164,5 +193,28 @@ class WorkerStartElectionTest {
                         + startingJac + ") - defaulting to 0 would give a busy worker a free pass to win every "
                         + "election it starts, and the whole JAC comparison in the echo phase would be decided "
                         + "against a number the worker never had");
+    }
+
+    @Test
+    void startElectionSendsElectionToEveryNeighbour() throws Exception {
+        worker = new WorkerRemoteImpl(1);
+        neighbourTwo = new RecordingWorkerRemote(2);
+        neighbourThree = new RecordingWorkerRemote(3);
+
+        registry.rebind("Worker2", neighbourTwo);
+        registry.rebind("Worker3", neighbourThree);
+
+        worker.connectAsNeighbour(2, HOST, TEST_RMI_PORT);
+        worker.connectAsNeighbour(3, HOST, TEST_RMI_PORT);
+
+        long messageId = worker.startElection();
+
+        assertTrue(neighbourTwo.receivedElection(1, messageId),
+                "an initiator must tell every neighbour it is standing for election - if worker 2 is skipped it "
+                        + "never learns about the election, never echoes back, and worker 1 waits on it forever, so "
+                        + "no coordinator is ever decided; recorded: " + neighbourTwo.calls());
+        assertTrue(neighbourThree.receivedElection(1, messageId),
+                "the ELECTION must carry the id startElection returned, so the echo that comes back can be matched "
+                        + "to this election; recorded: " + neighbourThree.calls());
     }
 }
