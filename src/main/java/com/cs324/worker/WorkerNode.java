@@ -85,6 +85,14 @@ public class WorkerNode {
         final WorkerRemoteImpl selfForHook = self;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
+                // Stop the job thread pool first. If removed, pool threads leak and the JVM can hang on exit.
+                if (selfForHook != null) {
+                    selfForHook.shutdown();
+                }
+            } catch (Exception ignored) {
+                // best effort on shutdown
+            }
+            try {
                 if (bootstrap[0] != null) {
                     bootstrap[0].deregisterWorker(idForHook);
                 }
