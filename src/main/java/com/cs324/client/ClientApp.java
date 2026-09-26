@@ -44,7 +44,7 @@ public class ClientApp extends JFrame {
 
     private final InputArea inputArea = new InputArea();
     private final JLabel exampleLabel = new JLabel();
-        private final JLabel statusLabel =
+    private final JLabel statusLabel =
             new JLabel("Ready to submit jobs");
 
     // Backend references (lazy: resolved on the first submission).
@@ -54,7 +54,7 @@ public class ClientApp extends JFrame {
     private final ConcurrentHashMap<Integer, Integer> rowByJobId = new ConcurrentHashMap<>();
     private final AtomicInteger nextRequestId = new AtomicInteger(1);
 
-        // The model stores submitted jobs; JTable displays them. Users cannot edit the rows.
+    // The model stores submitted jobs; JTable displays them. Users cannot edit the rows.
     private final DefaultTableModel jobModel = new DefaultTableModel(
             new String[]{"Job ID", "Operation", "Input", "Status", "Result"},
             0
@@ -206,7 +206,7 @@ public class ClientApp extends JFrame {
         JPanel history = card(new BorderLayout(0, 14));
         JPanel historyHeading = transparentPanel(new BorderLayout());
         historyHeading.add(sectionHeading("Job history",
-            "Track submitted jobs and their final results.", "list"), BorderLayout.CENTER);
+                "Track submitted jobs and their final results.", "list"), BorderLayout.CENTER);
         jobCount.setFont(BODY.deriveFont(12f));
         jobCount.setForeground(MUTED);
         historyHeading.add(jobCount, BorderLayout.EAST);
@@ -316,8 +316,8 @@ public class ClientApp extends JFrame {
         statusLabel.setIconTextGap(8);
         JPanel footer = transparentPanel(new BorderLayout(16, 0));
         footer.add(statusLabel, BorderLayout.CENTER);
-JLabel connectionHint = label("Jobs run on the worker cluster; results return here.",
-        12, Font.PLAIN, MUTED);
+        JLabel connectionHint = label("Jobs run on the worker cluster; results return here.",
+                12, Font.PLAIN, MUTED);
         connectionHint.setIcon(icon("info", 17, MUTED));
         connectionHint.setIconTextGap(7);
         footer.add(connectionHint, BorderLayout.EAST);
@@ -611,8 +611,8 @@ JLabel connectionHint = label("Jobs run on the worker cluster; results return he
     /**
      * Validates the current input and submits it to the current coordinator
      * on a background thread (never blocks the EDT). The coordinator splits
-     * the job among itself and its neighbours, then calls back with the
-     * aggregated result.
+     * the job among itself and every registered active worker, then calls
+     * back with the aggregated result.
      */
     private void submitJob() {
         long[] values;
@@ -646,78 +646,78 @@ JLabel connectionHint = label("Jobs run on the worker cluster; results return he
         new Thread(() -> {
             try {
                 connectBackend();
-final int jobId = bootstrap.allocateJobId();
+                final int jobId = bootstrap.allocateJobId();
 
-assignedId.set(jobId);
-rowByJobId.remove(requestId);
-rowByJobId.put(jobId, modelRow);
+                assignedId.set(jobId);
+                rowByJobId.remove(requestId);
+                rowByJobId.put(jobId, modelRow);
 
-// Discover the coordinator and retry submission if needed.
-int coordinatorId = -1;
-Exception lastError = null;
+                // Discover the coordinator and retry submission if needed.
+                int coordinatorId = -1;
+                Exception lastError = null;
 
-for (int attempt = 0; attempt < 3; attempt++) {
-    try {
-        WorkerRemote coordinator = discoverCoordinator();
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    try {
+                        WorkerRemote coordinator = discoverCoordinator();
 
-        if (coordinator == null) {
-            lastError = new RemoteException(
-                    "No coordinator found. Are workers running?");
-            Thread.sleep(500);
-            continue;
-        }
+                        if (coordinator == null) {
+                            lastError = new RemoteException(
+                                    "No coordinator found. Are workers running?");
+                            Thread.sleep(500);
+                            continue;
+                        }
 
-        coordinatorId = coordinator.getId();
+                        coordinatorId = coordinator.getId();
 
-        coordinator.submitJob(
-                jobId,
-                op,
-                finalPayload,
-                "localhost",
-                clientPort,
-                "Client"
-        );
+                        coordinator.submitJob(
+                                jobId,
+                                op,
+                                finalPayload,
+                                "localhost",
+                                clientPort,
+                                "Client"
+                        );
 
-        break;
+                        break;
 
-    } catch (RemoteException e) {
-        lastError = e;
-        Thread.sleep(500);
+                    } catch (RemoteException e) {
+                        lastError = e;
+                        Thread.sleep(500);
 
-    } catch (Exception e) {
-        lastError = e;
-        break;
-    }
-}
+                    } catch (Exception e) {
+                        lastError = e;
+                        break;
+                    }
+                }
 
-if (coordinatorId == -1) {
-    final String failMessage =
-            lastError != null && lastError.getMessage() != null
-                    ? lastError.getMessage()
-                    : "Unknown submission error";
+                if (coordinatorId == -1) {
+                    final String failMessage =
+                            lastError != null && lastError.getMessage() != null
+                                    ? lastError.getMessage()
+                                    : "Unknown submission error";
 
-    SwingUtilities.invokeLater(() ->
-            onSubmissionFailed(jobId, modelRow, failMessage)
-    );
+                    SwingUtilities.invokeLater(() ->
+                            onSubmissionFailed(jobId, modelRow, failMessage)
+                    );
 
-    return;
-}
+                    return;
+                }
 
-final int submittedCoordinatorId = coordinatorId;
+                final int submittedCoordinatorId = coordinatorId;
 
-SwingUtilities.invokeLater(() -> {
-    jobModel.setValueAt(jobId, modelRow, 0);
-    jobModel.setValueAt(
-            "Submitted to coordinator " + submittedCoordinatorId,
-            modelRow,
-            3
-    );
-    jobModel.setValueAt("Running", modelRow, 4);
+                SwingUtilities.invokeLater(() -> {
+                    jobModel.setValueAt(jobId, modelRow, 0);
+                    jobModel.setValueAt(
+                            "Submitted to coordinator " + submittedCoordinatorId,
+                            modelRow,
+                            3
+                    );
+                    jobModel.setValueAt("Running", modelRow, 4);
 
-    statusLabel.setText(
-            "Job " + jobId + " submitted to the coordinator."
-    );
-});
+                    statusLabel.setText(
+                            "Job " + jobId + " submitted to the coordinator."
+                    );
+                });
             } catch (Exception exception) {
                 String message = exception.getMessage() == null
                         ? exception.getClass().getSimpleName()
