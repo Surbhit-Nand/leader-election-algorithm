@@ -24,6 +24,17 @@ public class BootstrapRegistryImpl extends UnicastRemoteObject implements Bootst
 
     private final Map<Integer, WorkerAddress> activeWorkers = new ConcurrentHashMap<>();
 
+    private final java.util.concurrent.atomic.AtomicLong nextJobId =
+            new java.util.concurrent.atomic.AtomicLong(1);
+
+    @Override
+    public int allocateJobId() throws RemoteException {
+        // Allocate once for the whole cluster, rather than once per client window.
+        long jobId = nextJobId.getAndIncrement();
+        if (jobId > Integer.MAX_VALUE) throw new RemoteException("Job IDs exhausted.");
+        return (int) jobId;
+    }
+
     public BootstrapRegistryImpl() throws RemoteException {
         super();
     }

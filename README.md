@@ -207,10 +207,15 @@ decimal values and `long` inputs are rejected rather than silently converted.
 Very wide ranges can still be slow.
 
 The calculator is wired into worker execution: `WorkerRemoteImpl` delegates to
-`WorkerTaskCalculator` in `assignTask()`. Job submission (`submitJob()`) splits
-the payload into `PrimeRange` segments or `int[]` slices across the coordinator
-and its neighbours, aggregates the sub-results on the coordinator, and delivers
-the final value back to the client's `ClientRemote`.
+`WorkerTaskCalculator` for worker assignments and the coordinator's own chunk.
+`WorkerTaskDistributor` supplies the shared chunking and result-combination
+logic used by the coordinator's existing callback-based `submitJob()` flow.
+The coordinator looks up all registered, reachable workers through bootstrap,
+without changing their election-neighbour connections. It registers every expected
+partial result before sending chunks, then combines the answers only after dispatch
+and computation are complete. Each chunk carries the original coordinator's callback,
+so a worker does not need to be its neighbour and a later election does not redirect
+an in-progress job's answer. The existing client callback receives the final value.
 
 Run its tests:
 
@@ -223,3 +228,28 @@ Run the updated client:
 ```powershell
 mvn compile exec:java "-Dexec.mainClass=com.cs324.client.ClientApp"
 ```
+
+### Distribution integration
+
+The client obtains job IDs from `BootstrapRemote.allocateJobId()` so concurrent
+clients cannot accidentally reuse IDs. Bootstrap only allocates identifiers and
+provides worker addresses; it does not calculate, split or combine jobs. Manual RMI
+clients must also request their job IDs from bootstrap. IDs last for one bootstrap
+process; restart the whole cluster together when starting a fresh run.
+
+Each client process needs its own callback registry port. For two clients on the
+same machine, launch these in separate terminals after bootstrap and workers:
+
+```powershell
+java -cp target/classes com.cs324.client.ClientApp localhost 1099 1199
+java -cp target/classes com.cs324.client.ClientApp localhost 1099 1200
+```
+
+With four registered workers, PRIMESUM(1,1000) splits into 1-250, 251-500,
+501-750 and 751-1000 and combines to **76127**. The coordinator takes the first
+chunk. Smaller lists/ranges may use fewer workers to avoid empty chunks.
+
+`ClusterDistributionTest` uses four workers connected in a chain over RMI. It
+checks every worker's participation, the assignment's range example, waiting for
+a delayed worker, result delivery after a leader change, and two concurrent client
+callbacks with distinct job IDs. Existing election and threading tests remain intact.

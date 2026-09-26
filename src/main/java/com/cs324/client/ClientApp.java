@@ -22,7 +22,7 @@ import static com.cs324.client.ClientStyle.*;
 
 /**
  * Swing client for preparing and submitting MAX, PRIMESUM and PRIMECOUNT jobs.
- * Flow: enter or load data -> validate it -> (optional preview) -> submit to
+ * Flow: enter or load data -> validate it -> submit to
  * the current coordinator, which splits and aggregates the job, then reports
  * the final result back here.
  *
@@ -43,19 +43,19 @@ public class ClientApp extends JFrame {
 
     private final InputArea inputArea = new InputArea();
     private final JLabel exampleLabel = new JLabel();
-    private final JLabel statusLabel =
-            new JLabel("Connecting to coordinator...");
+        private final JLabel statusLabel =
+            new JLabel("Ready to submit jobs");
 
     // Backend references (lazy: resolved on the first submission).
     private BootstrapRemote bootstrap;
     private ClientRemoteImpl clientRemote;
     // Row index in the model of each in-flight (inSubmission) job this window owns.
     private final ConcurrentHashMap<Integer, Integer> rowByJobId = new ConcurrentHashMap<>();
-    private final AtomicInteger nextJobId = new AtomicInteger(1);
+    private final AtomicInteger nextRequestId = new AtomicInteger(1);
 
-    // The model stores preview rows; JTable displays them. Users cannot edit the rows.
+        // The model stores submitted jobs; JTable displays them. Users cannot edit the rows.
     private final DefaultTableModel jobModel = new DefaultTableModel(
-            new String[]{"Local reference", "Operation", "Input", "Status", "Result"},
+            new String[]{"Job ID", "Operation", "Input", "Status", "Result"},
             0
     ) {
         @Override
@@ -64,9 +64,7 @@ public class ClientApp extends JFrame {
         }
     };
 
-    // References belong to this window only; they are not backend job IDs.
-    private int nextReference = 1;
-    private final JLabel previewCount = new JLabel("0 previews");
+    private final JLabel jobCount = new JLabel("0 jobs");
     // CardLayout displays either the empty-state message or the populated table.
     private final CardLayout historyLayout = new CardLayout();
     private final JPanel historyContent = new JPanel(historyLayout);
@@ -92,7 +90,7 @@ public class ClientApp extends JFrame {
         root.setBorder(BorderFactory.createEmptyBorder(24, 28, 16, 28));
         setContentPane(root);
 
-        // The heading includes a breadcrumb, preview badge and decorative server graphic.
+        // The heading includes a breadcrumb and decorative server graphic.
         JPanel header = ClientStyle.header();
         header.setBorder(BorderFactory.createEmptyBorder(0, 20, 6, 20));
         JPanel heading = transparentPanel(null);
@@ -106,18 +104,9 @@ public class ClientApp extends JFrame {
         heading.add(Box.createVerticalStrut(5));
         heading.add(label("Prepare your data and review computational jobs.", 16, Font.PLAIN, MUTED));
         header.add(heading, BorderLayout.CENTER);
-        JButton mode = button("Submit mode", "server", true);
-        mode.setFont(BODY.deriveFont(12f));
-        mode.setBorder(BorderFactory.createEmptyBorder(7, 12, 7, 12));
-        mode.setFocusable(false);
-        mode.setCursor(Cursor.getDefaultCursor());
-        mode.setToolTipText("Submits validated jobs to the current coordinator.");
-        JPanel modePanel = transparentPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
-        modePanel.add(mode);
-        header.add(modePanel, BorderLayout.EAST);
         root.add(header, BorderLayout.NORTH);
 
-        // Rounded cards group the form and preview history without changing their behaviour.
+        // Rounded cards group the form and submitted job history.
         JPanel workspace = new Workspace();
         JPanel composer = card(new BorderLayout(0, 20));
         composer.add(sectionHeading("New job", "Choose an operation and provide input data.", "document"),
@@ -193,17 +182,14 @@ public class ClientApp extends JFrame {
         fields.add(inputPanel, BorderLayout.CENTER);
         composer.add(fields, BorderLayout.CENTER);
 
-        // Secondary actions stay on the left; validation is the primary action on the right.
+        // File and clear actions stay secondary; submitting is the primary action.
         // Mnemonics provide keyboard shortcuts, such as Alt+L for loading a file on Windows.
         JButton loadCsvButton = button("Load CSV", "folder", false);
-        JButton previewButton = button("Validate & preview", "play", false);
         JButton submitButton = button("Submit job", "send", true);
         JButton clearButton = button("Clear input", "trash", false);
         loadCsvButton.setMnemonic('L');
-        previewButton.setMnemonic('V');
         clearButton.setMnemonic('C');
         submitButton.setMnemonic('S');
-        previewButton.setToolTipText("Validate input and add a preview. No job is submitted.");
         submitButton.setToolTipText("Validate input and submit the job to the current coordinator.");
         JPanel actions = transparentPanel(new BorderLayout(10, 0));
         JPanel secondaryActions = transparentPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
@@ -211,22 +197,18 @@ public class ClientApp extends JFrame {
         secondaryActions.add(Box.createHorizontalStrut(10));
         secondaryActions.add(clearButton);
         actions.add(secondaryActions, BorderLayout.WEST);
-        JPanel primaryActions = transparentPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
-        primaryActions.add(previewButton);
-        primaryActions.add(Box.createHorizontalStrut(10));
-        primaryActions.add(submitButton);
-        actions.add(primaryActions, BorderLayout.EAST);
+        actions.add(submitButton, BorderLayout.EAST);
         composer.add(actions, BorderLayout.SOUTH);
         workspace.add(composer, BorderLayout.NORTH);
 
-        // The second card switches between an empty-state message and real preview rows.
+        // The second card switches between the empty state and submitted jobs.
         JPanel history = card(new BorderLayout(0, 14));
         JPanel historyHeading = transparentPanel(new BorderLayout());
-        historyHeading.add(sectionHeading("Job previews",
-                "Review and verify your input before submitting jobs.", "list"), BorderLayout.CENTER);
-        previewCount.setFont(BODY.deriveFont(12f));
-        previewCount.setForeground(MUTED);
-        historyHeading.add(previewCount, BorderLayout.EAST);
+        historyHeading.add(sectionHeading("Job history",
+            "Track submitted jobs and their final results.", "list"), BorderLayout.CENTER);
+        jobCount.setFont(BODY.deriveFont(12f));
+        jobCount.setForeground(MUTED);
+        historyHeading.add(jobCount, BorderLayout.EAST);
         history.add(historyHeading, BorderLayout.NORTH);
 
         // Sorting changes the displayed order, while the model remains the source of row data.
@@ -294,14 +276,14 @@ public class ClientApp extends JFrame {
         resultsPane.getViewport().setBackground(Color.WHITE);
         resultsPane.setPreferredSize(new Dimension(750, 190));
 
-        // Show instructions before the first preview; previewJob() switches to the table.
+        // Show instructions before the first job; submitJob() switches to the table.
         JPanel emptyState = transparentPanel(new GridBagLayout());
         emptyState.setBorder(new RoundBorder(true));
         JPanel emptyText = transparentPanel(null);
         emptyText.setLayout(new BoxLayout(emptyText, BoxLayout.Y_AXIS));
         JLabel emptyIcon = new JLabel(icon("document", 36, new Color(150, 164, 192)));
-        JLabel emptyTitle = label("Your job previews will appear here", 16, Font.BOLD, INK);
-        JLabel emptyHint = label("Choose an operation, add data, then validate your input.", 13, Font.PLAIN, MUTED);
+        JLabel emptyTitle = label("Your jobs and results will appear here", 16, Font.BOLD, INK);
+        JLabel emptyHint = label("Choose an operation, add data, then submit your job.", 13, Font.PLAIN, MUTED);
         emptyTitle.setHorizontalAlignment(SwingConstants.CENTER);
         emptyHint.setHorizontalAlignment(SwingConstants.CENTER);
         emptyIcon.setAlignmentX(Component.CENTER_ALIGNMENT);
@@ -341,14 +323,13 @@ JLabel connectionHint = label("Jobs run on the worker cluster; results return he
         root.add(footer, BorderLayout.SOUTH);
 
         // Event handlers connect user actions to behaviour; building buttons alone does not.
-        // Clearing input deliberately retains the preview history.
+        // Clearing input deliberately retains job history.
         jobTypeBox.addActionListener(event -> updateExample());
         loadCsvButton.addActionListener(event -> loadCsv());
-        previewButton.addActionListener(event -> previewJob());
         submitButton.addActionListener(event -> submitJob());
         clearButton.addActionListener(event -> {
             inputArea.setText("");
-            statusLabel.setText("Input cleared. Your previews are retained.");
+            statusLabel.setText("Input cleared. Your job history is retained.");
             inputArea.requestFocusInWindow();
         });
 
@@ -538,52 +519,20 @@ JLabel connectionHint = label("Jobs run on the worker cluster; results return he
     }
 
     /**
-     * Validates current input, appends a preview and updates the count/status.
-     * No RMI request occurs here: backend submission and result handling are still missing.
-     */
-    private void previewJob() {
-        try {
-            long[] values = parseInput(inputArea.getText());
-            String operation = (String) jobTypeBox.getSelectedItem();
-
-            String inputSummary = "PRIMESUM".equals(operation)
-                    ? values[0] + " to " + values[1]
-                    : values.length + " numbers";
-
-            jobModel.addRow(new Object[]{
-                    "Preview-" + nextReference++,
-                    operation,
-                    inputSummary,
-                    "Validated — not submitted",
-                    "Awaiting backend"
-            });
-            historyLayout.show(historyContent, "table");
-            int count = jobModel.getRowCount();
-            previewCount.setText(count + (count == 1 ? " preview" : " previews"));
-
-            statusLabel.setText(
-                    "Input validated. No computation has been submitted."
-            );
-        } catch (IllegalArgumentException exception) {
-            showError(exception.getMessage());
-        }
-    }
-
-    /**
      * Lazily contacts the Bootstrap node and binds this client's result channel
      * (ClientRemote) on its own registry so coordinators can report back.
      */
-    private void connectBackend() throws Exception {
-        if (bootstrap != null) {
-            return;
+    private synchronized void connectBackend() throws Exception {
+        if (clientRemote == null) {
+            Registry clientRegistry = LocateRegistry.createRegistry(clientPort);
+            clientRemote = new ClientRemoteImpl((jobId, result) ->
+                    SwingUtilities.invokeLater(() -> onResult(jobId, result)));
+            clientRegistry.rebind("Client", clientRemote);
         }
-        Registry clientRegistry = LocateRegistry.createRegistry(clientPort);
-        clientRemote = new ClientRemoteImpl((jobId, result) ->
-                SwingUtilities.invokeLater(() -> onResult(jobId, result)));
-        clientRegistry.rebind("Client", clientRemote);
-
-        Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
-        bootstrap = (BootstrapRemote) bootstrapRegistry.lookup("BootstrapRegistry");
+        if (bootstrap == null) {
+            Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
+            bootstrap = (BootstrapRemote) bootstrapRegistry.lookup("BootstrapRegistry");
+        }
     }
 
     /**
@@ -681,40 +630,53 @@ JLabel connectionHint = label("Jobs run on the worker cluster; results return he
         String inputSummary = "PRIMESUM".equals(operation)
                 ? values[0] + " to " + values[1]
                 : values.length + " numbers";
-        int jobId = nextJobId.getAndIncrement();
-        String ref = "Job-" + jobId;
-
+        // Use a local reference while bootstrap allocates a unique cluster job ID.
+        int requestId = -nextRequestId.getAndIncrement();
+        AtomicInteger assignedId = new AtomicInteger(requestId);
         final String op = operation;
         final Object finalPayload = payload;
+        final int modelRow = jobModel.getRowCount();
+        jobModel.addRow(new Object[]{"Connecting", op, inputSummary, "Connecting", ""});
+        rowByJobId.put(requestId, modelRow);
+        historyLayout.show(historyContent, "table");
+        jobCount.setText(jobModel.getRowCount() + (jobModel.getRowCount() == 1 ? " job" : " jobs"));
         statusLabel.setText("Contacting coordinator...");
 
         new Thread(() -> {
             try {
                 connectBackend();
+                final int jobId = bootstrap.allocateJobId();
+                assignedId.set(jobId);
+                rowByJobId.remove(requestId);
+                rowByJobId.put(jobId, modelRow);
                 WorkerRemote coordinator = discoverCoordinator();
                 if (coordinator == null) {
-                    SwingUtilities.invokeLater(() -> statusLabel.setText(
+                    SwingUtilities.invokeLater(() -> onSubmissionFailed(jobId, modelRow,
                             "No coordinator found. Are workers running?"));
                     return;
                 }
-                // The submitted row reflects the real job state; previews stay as-is.
-                final int modelRow = jobModel.getRowCount();
                 final int coordinatorId = coordinator.getId();
-                rowByJobId.put(jobId, modelRow);
                 SwingUtilities.invokeLater(() -> {
-                    jobModel.addRow(new Object[]{ref, op, inputSummary,
-                            "Submitted to coordinator " + coordinatorId, "Running"});
-                    historyLayout.show(historyContent, "table");
-                    previewCount.setText(jobModel.getRowCount()
-                            + (jobModel.getRowCount() == 1 ? " job" : " jobs"));
-                    statusLabel.setText("Job " + ref + " submitted to the coordinator.");
+                    jobModel.setValueAt(jobId, modelRow, 0);
+                    jobModel.setValueAt("Submitted to coordinator " + coordinatorId, modelRow, 3);
+                    jobModel.setValueAt("Running", modelRow, 4);
+                    statusLabel.setText("Job " + jobId + " submitted to the coordinator.");
                 });
                 coordinator.submitJob(jobId, op, finalPayload, "localhost", clientPort, "Client");
             } catch (Exception exception) {
-                SwingUtilities.invokeLater(() -> statusLabel.setText(
-                        "Submission failed: " + exception.getMessage()));
+                String message = exception.getMessage() == null
+                        ? exception.getClass().getSimpleName()
+                        : exception.getMessage();
+                SwingUtilities.invokeLater(() -> onSubmissionFailed(assignedId.get(), modelRow, message));
             }
         }).start();
+    }
+
+    private void onSubmissionFailed(int jobId, int row, String message) {
+        rowByJobId.remove(jobId);
+        jobModel.setValueAt("Failed", row, 3);
+        jobModel.setValueAt(message, row, 4);
+        statusLabel.setText("Job " + jobId + " failed: " + message);
     }
 
     /** Updates the matching row once the coordinator returns the aggregated result. */
@@ -724,7 +686,7 @@ JLabel connectionHint = label("Jobs run on the worker cluster; results return he
             return;
         }
         if (row >= 0 && row < jobModel.getRowCount()) {
-            jobModel.setValueAt("Completed", row, 3);
+            jobModel.setValueAt(result instanceof Number ? "Completed" : "Failed", row, 3);
             jobModel.setValueAt(String.valueOf(result), row, 4);
         }
         rowByJobId.remove(jobId);

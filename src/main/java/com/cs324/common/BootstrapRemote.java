@@ -16,6 +16,9 @@ public interface BootstrapRemote extends Remote {
 
     void deregisterWorker(int workerId) throws RemoteException;
 
+    // Shared IDs keep jobs from different clients separate. No computation happens here.
+    int allocateJobId() throws RemoteException;
+
     List<Integer> getActiveWorkerIds() throws RemoteException;
 
     // Address lookup so a joining worker can connect to the peer stub

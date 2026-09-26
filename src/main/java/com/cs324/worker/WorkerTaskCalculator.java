@@ -5,11 +5,11 @@ import java.util.Collection;
 import java.io.Serializable;
 import java.util.stream.IntStream;
 
-/** Standalone calculations with explicit list and range payloads. */
+/** Shared worker calculations with explicit list and range payloads. */
 public final class WorkerTaskCalculator {
     private WorkerTaskCalculator() {}
 
-    /** Inclusive prime range; serializable for future worker integration. */
+    /** Inclusive prime range, serializable for distributed worker assignments. */
     public record PrimeRange(int start, int end) implements Serializable {
         public PrimeRange {
             if (start > end) {
@@ -26,6 +26,8 @@ public final class WorkerTaskCalculator {
      * Empty prime lists return zero. No numeric narrowing conversions are performed.
      */
     public static Number calculate(String jobType, Object payload) {
+        // Apply the selected calculation to the input. Prime sums use long values
+        // because their total can be larger than a single integer.
         if ("MAX".equalsIgnoreCase(jobType)) {
             return numbers(jobType, payload).max()
                     .orElseThrow(() -> new IllegalArgumentException("MAX requires at least one value."));
@@ -49,6 +51,8 @@ public final class WorkerTaskCalculator {
             // Negative numbers and 0/1 cannot be prime; skip them without iterating.
             return IntStream.rangeClosed(Math.max(2, range.start()), range.end());
         }
+        // Read arrays and collections as lists, preserving repeated values.
+        // Reject non-integer entries rather than silently changing their values.
         if (payload instanceof int[] values) {
             return Arrays.stream(values);
         }
@@ -70,10 +74,18 @@ public final class WorkerTaskCalculator {
 
     /** Exact primality check without multiplication overflow. */
     public static boolean isPrime(int value) {
-        if (value < 2) return false;
-        if (value % 2 == 0) return value == 2;
+        if (value < 2) {
+            return false;
+        }
+        if (value % 2 == 0) {
+            return value == 2;
+        }
+        // After checking even numbers, try odd divisors up to the square root.
+        // Division avoids overflow that could occur when squaring the divisor.
         for (int divisor = 3; divisor <= value / divisor; divisor += 2) {
-            if (value % divisor == 0) return false;
+            if (value % divisor == 0) {
+                return false;
+            }
         }
         return true;
     }
