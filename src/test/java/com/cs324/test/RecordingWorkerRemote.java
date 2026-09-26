@@ -78,6 +78,27 @@ public class RecordingWorkerRemote extends UnicastRemoteObject implements Worker
     }
 
     @Override
+    public int getCurrentCoordinatorId() throws RemoteException {
+        return id;
+    }
+
+    @Override
+    public long startElection() throws RemoteException {
+        calls.add("startElection");
+        return 0L;
+    }
+
+    @Override
+    public void ping() throws RemoteException {
+        calls.add("ping");
+    }
+
+    @Override
+    public void submitJob(int jobId, String jobType, Object payload, String clientHost, int clientPort, String clientName) throws RemoteException {
+        calls.add("submit|" + jobId + "|" + jobType);
+    }
+
+    @Override
     public boolean isActive() throws RemoteException {
         return true;
     }

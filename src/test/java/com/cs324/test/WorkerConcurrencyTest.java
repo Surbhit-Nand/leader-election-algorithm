@@ -30,11 +30,16 @@ import static org.junit.jupiter.api.Assertions.fail;
  *
  * Covers the acceptance checklist without touching election semantics:
  *  - multiple jobs run concurrently and all complete (no head-of-line blocking)
- *  - duplicate assignTask(jobId) collapses to a single execution (no double work,
- *    JAC increments exactly once per unique job)
+ *  - duplicate assignTask(jobId) collapses to a single execution (no double work)
  *  - concurrent reportTaskResult() calls for the SAME jobId from DIFFERENT
  *    workers are all retained (no lost updates)
  *  - concurrent startElection() calls still produce unique message IDs
+ *
+ * JAC note: per the spec and the Design Decisions note, JAC counts assignments
+ * issued by a coordinator to other workers, so a worker RECEIVING assignTask()
+ * does not increment its own counter (that happens on the coordinator in
+ * submitJob()). These tests therefore assert the receiver's JAC stays 0 while
+ * still verifying exactly-once execution and concurrency safety.
  */
 class WorkerConcurrencyTest {
 
@@ -138,8 +143,11 @@ class WorkerConcurrencyTest {
                     coordinator.lastReportedResult(1000 + j, THIS_WORKER_ID),
                     "wrong MAX result for job " + (1000 + j));
         }
-        assertEquals(jobs, worker.getJobAllocationCounter(),
-                "JAC must increment exactly once per accepted job, atomically under concurrency");
+        // Assigning work is fire-and-return; the receiver never counts it.
+        // JAC is a coordinator-only counter (see submitJob()).
+        assertEquals(0, worker.getJobAllocationCounter(),
+                "a worker that receives assignTask() must not increment its own JAC; "
+                        + "JAC counts coordinator-side assignments only");
     }
 
     @Test
@@ -176,8 +184,8 @@ class WorkerConcurrencyTest {
         assertEquals(1L, reports,
                 "duplicate assignTask calls must collapse to one execution, otherwise work is "
                         + "duplicated; recorded: " + coordinator.calls());
-        assertEquals(1, worker.getJobAllocationCounter(),
-                "JAC must increment once for the accepted job, not once per duplicate");
+        assertEquals(0, worker.getJobAllocationCounter(),
+                "a receiver of assignTask() must not count the job; JAC is coordinator-only");
         assertEquals("19", coordinator.lastReportedResult(jobId, THIS_WORKER_ID));
     }
 

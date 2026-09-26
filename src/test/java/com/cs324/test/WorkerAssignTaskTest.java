@@ -1,6 +1,7 @@
 package com.cs324.test;
 
 import com.cs324.worker.WorkerRemoteImpl;
+import com.cs324.worker.WorkerTaskCalculator;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -28,9 +29,8 @@ import static org.junit.jupiter.api.Assertions.fail;
  * PRIMESUM over a range, PRIMECOUNT over a list) and prove that the result is
  * actually delivered to the coordinator over RMI.
  *
- * The JAC is deliberately NOT asserted here: where that counter increments is
- * still expected to move, and tying a test to its current position would lock in
- * behaviour that is known to be wrong.
+ * The JAC is deliberately NOT asserted here: JAC counts coordinator-side
+ * assignments (see submitJob()) and is covered by WorkerDispatchTest.
  */
 class WorkerAssignTaskTest {
 
@@ -115,7 +115,7 @@ class WorkerAssignTaskTest {
 
     @Test
     void reportsTheSumOfPrimesOverTheAssignedRange() throws Exception {
-        worker.assignTask(2, "PRIMESUM", new int[]{1, 10});
+        worker.assignTask(2, "PRIMESUM", new WorkerTaskCalculator.PrimeRange(1, 10));
 
         assertEquals("17", awaitReportedResult(2),
                 "PRIMESUM(1, 10) covers 2, 3, 5 and 7, which sum to 17");

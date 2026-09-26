@@ -31,6 +31,26 @@ public class FakeWorkerRemote extends UnicastRemoteObject implements WorkerRemot
     }
 
     @Override
+    public int getCurrentCoordinatorId() throws RemoteException {
+        return id;
+    }
+
+    @Override
+    public long startElection() throws RemoteException {
+        return 0L;
+    }
+
+    @Override
+    public void ping() throws RemoteException {
+        // not needed for these tests
+    }
+
+    @Override
+    public void submitJob(int jobId, String jobType, Object payload, String clientHost, int clientPort, String clientName) throws RemoteException {
+        // not needed for these tests
+    }
+
+    @Override
     public boolean isActive() throws RemoteException {
         return true;
     }
