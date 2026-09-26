@@ -1,6 +1,7 @@
 package com.cs324.worker;
 
 import com.cs324.common.BootstrapRemote;
+import com.cs324.common.TaskAssignment;
 import com.cs324.common.ClientRemote;
 import com.cs324.common.Constants;
 import com.cs324.common.WorkerAddress;
@@ -10,12 +11,10 @@ import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.NotBoundException;
 import java.rmi.server.UnicastRemoteObject;
-import java.util.Arrays;
 import java.util.Map;
 import java.util.Set;
 import java.util.List;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -112,7 +111,9 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     // A submitted job is split across the coordinator and its neighbours; the
     // coordinator tracks which workers it is still waiting on and aggregates
     // results once all have reported back.
-    private record JobState(String jobType, Set<Integer> expected, String clientHost, int clientPort, String clientName) {}
+    private record JobState(String jobType, Set<Integer> expected, String clientHost, int clientPort, String clientName, AtomicBoolean dispatchComplete) {}
+
+    private final Set<Integer> submittedJobIds = ConcurrentHashMap.newKeySet();
 
     private final Map<Integer, JobState> coordinatingJobs = new ConcurrentHashMap<>();
 
@@ -397,6 +398,13 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
             return;
         }
 
+        // Distributed chunks carry the original coordinator's address, so results
+        // return correctly across neighbour hops and later leader changes.
+        final Object calculationPayload = payload instanceof TaskAssignment assignment
+                ? assignment.payload() : payload;
+        final WorkerRemote resultReceiver = payload instanceof TaskAssignment assignment
+                ? assignment.coordinator() : null;
+
         // Copy jobType for the background thread. If removed, a changed variable could send the wrong computation.
         final String typeSnapshot = jobType;
         try {
@@ -406,7 +414,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 Object computedResult;
                 try {
                     // Delegate to the shared calculator (shares logic with the client preview).
-                    computedResult = WorkerTaskCalculator.calculate(typeSnapshot, payload);
+                    computedResult = WorkerTaskCalculator.calculate(typeSnapshot, calculationPayload);
                 } catch (Exception e) {
                     // Turn crashes into an error message. If removed, one bad payload kills the thread with no result.
                     computedResult = "Error executing task: " + e.getMessage();
@@ -418,7 +426,9 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                     // One read of the leader. If removed (two reads), the leader can change between reads and the result goes to the wrong node.
                     int targetCoordinator = currentCoordinatorId;
                     // We are the leader (or none known): keep the result locally. If removed, results are always sent over the network, even to ourselves.
-                    if (targetCoordinator == id || targetCoordinator == -1) {
+                    if (resultReceiver != null) {
+                        resultReceiver.reportTaskResult(jobId, id, computedResult);
+                    } else if (targetCoordinator == id || targetCoordinator == -1) {
                         reportTaskResult(jobId, id, computedResult);
                     } else {
                         // Look up the leader's connection. If removed, results can never be forwarded.
@@ -452,25 +462,31 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
     @Override
     public void reportTaskResult(int jobId, int workerId, Object result) throws RemoteException {
-        // Keyed by (jobId, workerId): concurrent reports for the same job from
-        // different workers no longer overwrite each other (no lost updates).
-        // Save one worker's answer. If removed, results are never stored and the job looks unfinished.
-        taskResults.put(new JobResultKey(jobId, workerId), result);
-
-        // Coordinator bookkeeping: if this job was dispatched by us, mark the
-        // piece as delivered and, once every participant has answered, aggregate
-        // and hand the final result back to the client.
         JobState state = coordinatingJobs.get(jobId);
-        if (state != null) {
-            state.expected().remove(workerId);
-            if (state.expected().isEmpty() && coordinatingJobs.remove(jobId) != null) {
-                Object finalResult = aggregateJob(state.jobType(), jobId);
-                deliverToClient(jobId, finalResult, state);
-                // Term expiry: starting a new election favouring the lowest JAC
-                // rotates leadership after JOBS_PER_TERM assignments.
-                maybeRotateCoordinator();
-            }
+        if (state == null) {
+            taskResults.putIfAbsent(new JobResultKey(jobId, workerId), result);
+            return;
         }
+        // Accept each expected worker only once. Store its answer before marking
+        // it finished, so the last callback sees every partial result.
+        synchronized (state) {
+            if (!state.expected().contains(workerId)) return;
+            taskResults.put(new JobResultKey(jobId, workerId), result);
+            state.expected().remove(workerId);
+        }
+        finishJobIfReady(jobId, state);
+    }
+
+    private void finishJobIfReady(int jobId, JobState state) {
+        // A fast calculation may finish while dispatch is still running. Wait for
+        // both dispatch and every expected answer before sending one final result.
+        synchronized (state) {
+            if (!state.dispatchComplete().get() || !state.expected().isEmpty()
+                    || !coordinatingJobs.remove(jobId, state)) return;
+        }
+        Object result = aggregateJob(state.jobType(), jobId);
+        deliverToClient(jobId, result, state);
+        maybeRotateCoordinator();
     }
 
     /**
@@ -483,20 +499,23 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         if (currentCoordinatorId != id) {
             throw new RemoteException("Worker " + id + " is not the current coordinator (coordinator=" + currentCoordinatorId + ")");
         }
-        // Repeated delivery of the same jobId is ignored (client retries).
-        if (coordinatingJobs.containsKey(jobId)) {
-            return;
-        }
-
-        // Participants: the coordinator itself plus every neighbour it knows.
+        // Use bootstrap to find all registered workers without adding election
+        // neighbours. Tests without bootstrap retain their directly connected peers.
+        Map<Integer, WorkerRemote> available = discoverJobWorkers();
         List<Integer> participants = new ArrayList<>();
         participants.add(id);
-        participants.addAll(neighbours.keySet());
+        available.keySet().stream().filter(workerId -> workerId != id).sorted().forEach(participants::add);
         List<Object> chunks = splitPayload(jobType, payload, participants.size());
+        if (!submittedJobIds.add(jobId)) return;
 
+        // Register the entire job before any thread can report a result.
         Set<Integer> expected = ConcurrentHashMap.newKeySet();
-        JobState state = new JobState(jobType, expected, clientHost, clientPort, clientName);
+        for (int i = 0; i < participants.size(); i++) {
+            if (chunks.get(i) != null) expected.add(participants.get(i));
+        }
+        JobState state = new JobState(jobType, expected, clientHost, clientPort, clientName, new AtomicBoolean());
         coordinatingJobs.put(jobId, state);
+        WorkerRemote callback = (WorkerRemote) UnicastRemoteObject.toStub(this);
 
         final String typeSnapshot = jobType;
         for (int i = 0; i < participants.size(); i++) {
@@ -505,7 +524,6 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 continue; // empty slice for this participant
             }
             int targetId = participants.get(i);
-            expected.add(targetId);
             if (targetId == id) {
                 // Our own share: compute locally on a pool thread.
                 final Object selfChunk = chunk;
@@ -524,7 +542,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
             } else {
                 // Assigning to another worker: this is what counts against the JAC.
                 jobAllocationCounter.incrementAndGet();
-                WorkerRemote stub = neighbours.get(targetId);
+                WorkerRemote stub = available.get(targetId);
                 if (stub == null) {
                     // The neighbour vanished mid-dispatch: compute its slice locally instead.
                     final Object slice = chunk;
@@ -537,7 +555,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                     continue;
                 }
                 try {
-                    stub.assignTask(jobId, typeSnapshot, chunk);
+                    stub.assignTask(jobId, typeSnapshot, new TaskAssignment(chunk, callback));
                 } catch (RemoteException e) {
                     // Dead participant: forget it and compute its slice locally so
                     // the job still completes with the correct aggregate.
@@ -558,108 +576,57 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 }
             }
         }
+        state.dispatchComplete().set(true);
+        finishJobIfReady(jobId, state);
+    }
+
+    private Map<Integer, WorkerRemote> discoverJobWorkers() throws RemoteException {
+        Map<Integer, WorkerRemote> workers = new HashMap<>();
+        BootstrapRemote directory = bootstrap;
+        if (directory == null) {
+            workers.putAll(neighbours);
+        } else {
+            for (int workerId : directory.getActiveWorkerIds()) {
+                if (workerId == id) continue;
+                WorkerAddress address = directory.getWorkerAddress(workerId);
+                if (address == null) continue;
+                try {
+                    WorkerRemote worker = (WorkerRemote) LocateRegistry.getRegistry(
+                            address.getRmiHost(), address.getRmiPort()).lookup("Worker" + workerId);
+                    if (worker.isActive()) workers.put(workerId, worker);
+                } catch (RemoteException | NotBoundException ignored) {
+                    // Skip stale registrations; split the job among reachable workers.
+                }
+            }
+        }
+        workers.put(id, this);
+        return workers;
     }
 
     /** Slice a payload into `parts` roughly equal slices; empty slices are null. */
     private List<Object> splitPayload(String jobType, Object payload, int parts) {
-        List<Object> chunks = new ArrayList<>();
-        if (payload instanceof WorkerTaskCalculator.PrimeRange range) {
-            long total = (long) range.end() - range.start() + 1L;
-            if (total <= 0) {
-                chunks.add(payload);
-                for (int i = 1; i < parts; i++) {
-                    chunks.add(null);
-                }
-                return chunks;
-            }
-            long base = total / parts;
-            long rem = total % parts;
-            long offset = 0;
-            for (int i = 0; i < parts; i++) {
-                long len = base + (i < rem ? 1 : 0);
-                if (len == 0) {
-                    chunks.add(null);
-                    continue;
-                }
-                int s = (int) (range.start() + offset);
-                int e = (int) (s + len - 1);
-                chunks.add(new WorkerTaskCalculator.PrimeRange(s, e));
-                offset += len;
-            }
-            return chunks;
-        }
-        int[] arr = toIntArray(payload);
-        if (arr.length == 0) {
-            chunks.add(payload);
-            for (int i = 1; i < parts; i++) {
-                chunks.add(null);
-            }
-            return chunks;
-        }
-        long base = arr.length / parts;
-        long rem = arr.length % parts;
-        int index = 0;
-        for (int i = 0; i < parts; i++) {
-            int len = (int) (base + (i < rem ? 1 : 0));
-            if (len == 0) {
-                chunks.add(null);
-                continue;
-            }
-            chunks.add(Arrays.copyOfRange(arr, index, index + len));
-            index += len;
+        List<Object> chunks = new ArrayList<>(WorkerTaskDistributor.split(jobType, payload, parts));
+        while (chunks.size() < parts) {
+            chunks.add(null);
         }
         return chunks;
-    }
-
-    private int[] toIntArray(Object payload) {
-        if (payload instanceof int[]) {
-            return (int[]) payload;
-        }
-        List<Integer> list = new ArrayList<>();
-        if (payload instanceof Integer[]) {
-            for (Integer v : (Integer[]) payload) {
-                if (v != null) list.add(v);
-            }
-        } else if (payload instanceof Collection) {
-            for (Object o : (Collection<?>) payload) {
-                if (o instanceof Number) list.add(((Number) o).intValue());
-            }
-        }
-        int[] out = new int[list.size()];
-        for (int i = 0; i < out.length; i++) {
-            out[i] = list.get(i);
-        }
-        return out;
     }
 
     /** Combine the per-worker pieces once every participant has reported. */
     private Object aggregateJob(String jobType, int jobId) {
         Map<Integer, Object> results = getJobResults(jobId);
-        if ("MAX".equalsIgnoreCase(jobType)) {
-            int max = Integer.MIN_VALUE;
-            for (Object r : results.values()) {
-                if (!(r instanceof Number)) return r; // propagate an error result
-                max = Math.max(max, ((Number) r).intValue());
+        List<Number> partialResults = new ArrayList<>(results.size());
+        for (Object result : results.values()) {
+            if (!(result instanceof Number number)) {
+                return result;
             }
-            return max;
+            partialResults.add(number);
         }
-        if ("PRIMESUM".equalsIgnoreCase(jobType)) {
-            long sum = 0;
-            for (Object r : results.values()) {
-                if (!(r instanceof Number)) return r;
-                sum += ((Number) r).longValue();
-            }
-            return sum;
+        try {
+            return WorkerTaskDistributor.combine(jobType, partialResults);
+        } catch (ArithmeticException | IllegalArgumentException e) {
+            return "Error aggregating task: " + e.getMessage();
         }
-        if ("PRIMECOUNT".equalsIgnoreCase(jobType)) {
-            int count = 0;
-            for (Object r : results.values()) {
-                if (!(r instanceof Number)) return r;
-                count += ((Number) r).intValue();
-            }
-            return count;
-        }
-        return null;
     }
 
     /** Send the final answer back to the client that submitted the job. */
