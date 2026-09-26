@@ -13,6 +13,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.util.List;
@@ -645,24 +646,79 @@ JLabel connectionHint = label("Jobs run on the worker cluster; results return he
         new Thread(() -> {
             try {
                 connectBackend();
-                final int jobId = bootstrap.allocateJobId();
-                assignedId.set(jobId);
-                rowByJobId.remove(requestId);
-                rowByJobId.put(jobId, modelRow);
-                WorkerRemote coordinator = discoverCoordinator();
-                if (coordinator == null) {
-                    SwingUtilities.invokeLater(() -> onSubmissionFailed(jobId, modelRow,
-                            "No coordinator found. Are workers running?"));
-                    return;
-                }
-                final int coordinatorId = coordinator.getId();
-                SwingUtilities.invokeLater(() -> {
-                    jobModel.setValueAt(jobId, modelRow, 0);
-                    jobModel.setValueAt("Submitted to coordinator " + coordinatorId, modelRow, 3);
-                    jobModel.setValueAt("Running", modelRow, 4);
-                    statusLabel.setText("Job " + jobId + " submitted to the coordinator.");
+final int jobId = bootstrap.allocateJobId();
+
+assignedId.set(jobId);
+rowByJobId.remove(requestId);
+rowByJobId.put(jobId, modelRow);
+
+// Discover the coordinator and retry submission if needed.
+int coordinatorId = -1;
+Exception lastError = null;
+
+for (int attempt = 0; attempt < 3; attempt++) {
+    try {
+        WorkerRemote coordinator = discoverCoordinator();
+
+        if (coordinator == null) {
+            lastError = new RemoteException(
+                    "No coordinator found. Are workers running?");
+            Thread.sleep(500);
+            continue;
+        }
+
+        coordinatorId = coordinator.getId();
+
+        coordinator.submitJob(
+                jobId,
+                op,
+                finalPayload,
+                "localhost",
+                clientPort,
+                "Client"
+        );
+
+        break;
+
+    } catch (RemoteException e) {
+        lastError = e;
+        Thread.sleep(500);
+
+    } catch (Exception e) {
+        lastError = e;
+        break;
+    }
+}
+
+if (coordinatorId == -1) {
+    final String failMessage =
+            lastError != null && lastError.getMessage() != null
+                    ? lastError.getMessage()
+                    : "Unknown submission error";
+
+    SwingUtilities.invokeLater(() ->
+            onSubmissionFailed(jobId, modelRow, failMessage)
+    );
+
+    return;
+}
+
+final int submittedCoordinatorId = coordinatorId;
+
+SwingUtilities.invokeLater(() -> {
+    jobModel.setValueAt(jobId, modelRow, 0);
+    jobModel.setValueAt(
+            "Submitted to coordinator " + submittedCoordinatorId,
+            modelRow,
+            3
+    );
+    jobModel.setValueAt("Running", modelRow, 4);
+
+    statusLabel.setText(
+            "Job " + jobId + " submitted to the coordinator."
+    );
+});
                 });
-                coordinator.submitJob(jobId, op, finalPayload, "localhost", clientPort, "Client");
             } catch (Exception exception) {
                 String message = exception.getMessage() == null
                         ? exception.getClass().getSimpleName()
