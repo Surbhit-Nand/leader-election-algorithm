@@ -1,11 +1,16 @@
 package com.cs324.worker;
 
+import com.cs324.common.BootstrapRemote;
+import com.cs324.common.ClientRemote;
+import com.cs324.common.Constants;
+import com.cs324.common.WorkerAddress;
 import com.cs324.common.WorkerRemote;
 import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.NotBoundException;
 import java.rmi.server.UnicastRemoteObject;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.Set;
 import java.util.List;
@@ -17,7 +22,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -100,6 +108,32 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     // If removed, we cannot count or observe running jobs.
     private final Map<Integer, Future<?>> activeTasks = new ConcurrentHashMap<>();
 
+    // ---- Coordinator job dispatch (client jobs) ----
+    // A submitted job is split across the coordinator and its neighbours; the
+    // coordinator tracks which workers it is still waiting on and aggregates
+    // results once all have reported back.
+    private record JobState(String jobType, Set<Integer> expected, String clientHost, int clientPort, String clientName) {}
+
+    private final Map<Integer, JobState> coordinatingJobs = new ConcurrentHashMap<>();
+
+    // ---- Heartbeat / coordinator-failure detection ----
+    // Daemon scheduler so a forgotten shutdown never hangs the JVM.
+    private final ScheduledExecutorService heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "worker-heartbeat");
+        t.setDaemon(true);
+        return t;
+    });
+    // Set by WorkerNode once the worker has registered with the bootstrap.
+    private volatile BootstrapRemote bootstrap;
+    // Cached coordinator stub (reused across beats; reset when it fails).
+    private volatile WorkerRemote coordinatorStub;
+    private volatile int cachedCoordinatorId = -1;
+    // Skip a beat if the previous one is still blocked on a slow coordinator,
+    // so a slow peer cannot stack up probes.
+    private final AtomicBoolean heartbeatInFlight = new AtomicBoolean(false);
+    // Next JAC threshold at which this coordinator starts a new term's election.
+    private volatile int termTrigger = Constants.JOBS_PER_TERM;
+
     public WorkerRemoteImpl(int id) throws RemoteException {
         super();
         this.id = id;
@@ -115,7 +149,8 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         return jobAllocationCounter.get();
     }
 
-    public int getCurrentCoordinatorId() {
+    @Override
+    public int getCurrentCoordinatorId() throws RemoteException {
         return currentCoordinatorId;
     }
 
@@ -354,13 +389,13 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         // Group 6 — exactly-once per jobId: concurrent duplicate submissions
         // (e.g. coordinator retries) collapse to a single execution. add() is
         // atomic on the concurrent set. Distinct jobIds proceed in parallel.
-        // The JAC increments exactly once per accepted (first-seen) job.
+        // Note: the JAC is NOT incremented here. Per the spec and the Design
+        // Decisions note, JAC counts assignments issued by a coordinator, not
+        // work received. The coordinator increments it in submitJob().
         // Claim this jobId; duplicates exit here. If removed, every retry re-runs the whole computation (double work).
         if (!seenJobIds.add(jobId)) {
             return;
         }
-        // Count this accepted job. Atomic = no lost increments. If removed, elections use a wrong JAC and pick the wrong leader.
-        jobAllocationCounter.incrementAndGet();
 
         // Copy jobType for the background thread. If removed, a changed variable could send the wrong computation.
         final String typeSnapshot = jobType;
@@ -370,16 +405,8 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 // Holder for the answer. If removed, there is nowhere to store the result.
                 Object computedResult;
                 try {
-                    // Pick the computation by type. If removed, every job runs the same (wrong) calculation.
-                    if ("MAX".equalsIgnoreCase(typeSnapshot)) {
-                        computedResult = computeMax(payload);
-                    } else if ("PRIMESUM".equalsIgnoreCase(typeSnapshot)) {
-                        computedResult = computePrimeSum(payload);
-                    } else if ("PRIMECOUNT".equalsIgnoreCase(typeSnapshot)) {
-                        computedResult = computePrimeCount(payload);
-                    } else {
-                        computedResult = "Unsupported job type: " + typeSnapshot;
-                    }
+                    // Delegate to the shared calculator (shares logic with the client preview).
+                    computedResult = WorkerTaskCalculator.calculate(typeSnapshot, payload);
                 } catch (Exception e) {
                     // Turn crashes into an error message. If removed, one bad payload kills the thread with no result.
                     computedResult = "Error executing task: " + e.getMessage();
@@ -429,6 +456,297 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         // different workers no longer overwrite each other (no lost updates).
         // Save one worker's answer. If removed, results are never stored and the job looks unfinished.
         taskResults.put(new JobResultKey(jobId, workerId), result);
+
+        // Coordinator bookkeeping: if this job was dispatched by us, mark the
+        // piece as delivered and, once every participant has answered, aggregate
+        // and hand the final result back to the client.
+        JobState state = coordinatingJobs.get(jobId);
+        if (state != null) {
+            state.expected().remove(workerId);
+            if (state.expected().isEmpty() && coordinatingJobs.remove(jobId) != null) {
+                Object finalResult = aggregateJob(state.jobType(), jobId);
+                deliverToClient(jobId, finalResult, state);
+                // Term expiry: starting a new election favouring the lowest JAC
+                // rotates leadership after JOBS_PER_TERM assignments.
+                maybeRotateCoordinator();
+            }
+        }
+    }
+
+    /**
+     * Called by a Client via RMI. This node must currently be the coordinator:
+     * it splits the payload across itself and its neighbours, tracks the pieces
+     * in progress, and reports the aggregated result back to the client.
+     */
+    @Override
+    public void submitJob(int jobId, String jobType, Object payload, String clientHost, int clientPort, String clientName) throws RemoteException {
+        if (currentCoordinatorId != id) {
+            throw new RemoteException("Worker " + id + " is not the current coordinator (coordinator=" + currentCoordinatorId + ")");
+        }
+        // Repeated delivery of the same jobId is ignored (client retries).
+        if (coordinatingJobs.containsKey(jobId)) {
+            return;
+        }
+
+        // Participants: the coordinator itself plus every neighbour it knows.
+        List<Integer> participants = new ArrayList<>();
+        participants.add(id);
+        participants.addAll(neighbours.keySet());
+        List<Object> chunks = splitPayload(jobType, payload, participants.size());
+
+        Set<Integer> expected = ConcurrentHashMap.newKeySet();
+        JobState state = new JobState(jobType, expected, clientHost, clientPort, clientName);
+        coordinatingJobs.put(jobId, state);
+
+        final String typeSnapshot = jobType;
+        for (int i = 0; i < participants.size(); i++) {
+            Object chunk = chunks.get(i);
+            if (chunk == null) {
+                continue; // empty slice for this participant
+            }
+            int targetId = participants.get(i);
+            expected.add(targetId);
+            if (targetId == id) {
+                // Our own share: compute locally on a pool thread.
+                final Object selfChunk = chunk;
+                executor.submit(() -> {
+                    Object result;
+                    try {
+                        result = WorkerTaskCalculator.calculate(typeSnapshot, selfChunk);
+                    } catch (Exception e) {
+                        result = "Error executing task: " + e.getMessage();
+                    }
+                    try {
+                        reportTaskResult(jobId, id, result);
+                    } catch (RemoteException ignored) {
+                    }
+                });
+            } else {
+                // Assigning to another worker: this is what counts against the JAC.
+                jobAllocationCounter.incrementAndGet();
+                WorkerRemote stub = neighbours.get(targetId);
+                if (stub == null) {
+                    // The neighbour vanished mid-dispatch: compute its slice locally instead.
+                    final Object slice = chunk;
+                    executor.submit(() -> {
+                        try {
+                            reportTaskResult(jobId, targetId, WorkerTaskCalculator.calculate(typeSnapshot, slice));
+                        } catch (RemoteException ignored) {
+                        }
+                    });
+                    continue;
+                }
+                try {
+                    stub.assignTask(jobId, typeSnapshot, chunk);
+                } catch (RemoteException e) {
+                    // Dead participant: forget it and compute its slice locally so
+                    // the job still completes with the correct aggregate.
+                    neighbours.remove(targetId);
+                    final Object slice = chunk;
+                    executor.submit(() -> {
+                        Object fallback;
+                        try {
+                            fallback = WorkerTaskCalculator.calculate(typeSnapshot, slice);
+                        } catch (Exception ex) {
+                            fallback = "Error executing task: " + ex.getMessage();
+                        }
+                        try {
+                            reportTaskResult(jobId, targetId, fallback);
+                        } catch (RemoteException ignored) {
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /** Slice a payload into `parts` roughly equal slices; empty slices are null. */
+    private List<Object> splitPayload(String jobType, Object payload, int parts) {
+        List<Object> chunks = new ArrayList<>();
+        if (payload instanceof WorkerTaskCalculator.PrimeRange range) {
+            long total = (long) range.end() - range.start() + 1L;
+            if (total <= 0) {
+                chunks.add(payload);
+                for (int i = 1; i < parts; i++) {
+                    chunks.add(null);
+                }
+                return chunks;
+            }
+            long base = total / parts;
+            long rem = total % parts;
+            long offset = 0;
+            for (int i = 0; i < parts; i++) {
+                long len = base + (i < rem ? 1 : 0);
+                if (len == 0) {
+                    chunks.add(null);
+                    continue;
+                }
+                int s = (int) (range.start() + offset);
+                int e = (int) (s + len - 1);
+                chunks.add(new WorkerTaskCalculator.PrimeRange(s, e));
+                offset += len;
+            }
+            return chunks;
+        }
+        int[] arr = toIntArray(payload);
+        if (arr.length == 0) {
+            chunks.add(payload);
+            for (int i = 1; i < parts; i++) {
+                chunks.add(null);
+            }
+            return chunks;
+        }
+        long base = arr.length / parts;
+        long rem = arr.length % parts;
+        int index = 0;
+        for (int i = 0; i < parts; i++) {
+            int len = (int) (base + (i < rem ? 1 : 0));
+            if (len == 0) {
+                chunks.add(null);
+                continue;
+            }
+            chunks.add(Arrays.copyOfRange(arr, index, index + len));
+            index += len;
+        }
+        return chunks;
+    }
+
+    private int[] toIntArray(Object payload) {
+        if (payload instanceof int[]) {
+            return (int[]) payload;
+        }
+        List<Integer> list = new ArrayList<>();
+        if (payload instanceof Integer[]) {
+            for (Integer v : (Integer[]) payload) {
+                if (v != null) list.add(v);
+            }
+        } else if (payload instanceof Collection) {
+            for (Object o : (Collection<?>) payload) {
+                if (o instanceof Number) list.add(((Number) o).intValue());
+            }
+        }
+        int[] out = new int[list.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = list.get(i);
+        }
+        return out;
+    }
+
+    /** Combine the per-worker pieces once every participant has reported. */
+    private Object aggregateJob(String jobType, int jobId) {
+        Map<Integer, Object> results = getJobResults(jobId);
+        if ("MAX".equalsIgnoreCase(jobType)) {
+            int max = Integer.MIN_VALUE;
+            for (Object r : results.values()) {
+                if (!(r instanceof Number)) return r; // propagate an error result
+                max = Math.max(max, ((Number) r).intValue());
+            }
+            return max;
+        }
+        if ("PRIMESUM".equalsIgnoreCase(jobType)) {
+            long sum = 0;
+            for (Object r : results.values()) {
+                if (!(r instanceof Number)) return r;
+                sum += ((Number) r).longValue();
+            }
+            return sum;
+        }
+        if ("PRIMECOUNT".equalsIgnoreCase(jobType)) {
+            int count = 0;
+            for (Object r : results.values()) {
+                if (!(r instanceof Number)) return r;
+                count += ((Number) r).intValue();
+            }
+            return count;
+        }
+        return null;
+    }
+
+    /** Send the final answer back to the client that submitted the job. */
+    private void deliverToClient(int jobId, Object result, JobState state) {
+        try {
+            Registry clientRegistry = LocateRegistry.getRegistry(state.clientHost(), state.clientPort());
+            ClientRemote client = (ClientRemote) clientRegistry.lookup(state.clientName());
+            client.receiveJobResult(jobId, result);
+        } catch (Exception e) {
+            System.out.println("Worker " + id + ": could not deliver result for job " + jobId
+                    + " to client : " + e.getMessage());
+        }
+    }
+
+    /**
+     * Term expiry: after JOBS_PER_TERM assignments the coordinator yields by
+     * starting a new election; the lowest-JAC worker wins and leadership rotates.
+     */
+    private void maybeRotateCoordinator() {
+        if (jobAllocationCounter.get() >= termTrigger) {
+            termTrigger += Constants.JOBS_PER_TERM;
+            startElection();
+        }
+    }
+
+    // ---- Heartbeat / coordinator-failure detection ----
+
+    /** Wires the bootstrap reference and starts the periodic probe. */
+    public void setBootstrapReference(BootstrapRemote bootstrap, String localHost) {
+        this.bootstrap = bootstrap;
+        heartbeatExecutor.scheduleAtFixedRate(this::heartbeatTick,
+                Constants.HEARTBEAT_INTERVAL_MS, Constants.HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    @Override
+    public void ping() throws RemoteException {
+        // Reachable = alive. No work to do; just being exported is enough.
+    }
+
+    private void heartbeatTick() {
+        int coord = currentCoordinatorId;
+        if (coord == -1 || coord == id || bootstrap == null) {
+            return;
+        }
+        // Skip this beat if the last probe is still outstanding.
+        if (!heartbeatInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            WorkerRemote stub = resolveCoordinatorStub(coord);
+            if (stub == null) {
+                return;
+            }
+            try {
+                stub.ping();
+            } catch (RemoteException e) {
+                // Coordinator did not answer: treat it as dead and re-elect.
+                coordinatorStub = null;
+                startElection();
+            }
+        } catch (Exception e) {
+            // Not bound, lookup failed, or bootstrap unreachable: assume the
+            // coordinator is gone.
+            coordinatorStub = null;
+            startElection();
+        } finally {
+            heartbeatInFlight.set(false);
+        }
+    }
+
+    private WorkerRemote resolveCoordinatorStub(int coord) {
+        if (coordinatorStub != null && cachedCoordinatorId == coord) {
+            return coordinatorStub;
+        }
+        try {
+            WorkerAddress address = bootstrap.getWorkerAddress(coord);
+            if (address == null) {
+                return null;
+            }
+            Registry registry = LocateRegistry.getRegistry(address.getRmiHost(), address.getRmiPort());
+            WorkerRemote stub = (WorkerRemote) registry.lookup("Worker" + coord);
+            coordinatorStub = stub;
+            cachedCoordinatorId = coord;
+            return stub;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
@@ -439,6 +757,8 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     public void shutdown() {
         // Stop the pool (lets running jobs finish). If removed, threads leak and the JVM hangs on exit.
         executor.shutdown();
+        // Stop the heartbeat scheduler (daemon, but clean shutdown is tidy).
+        heartbeatExecutor.shutdown();
     }
 
     public boolean isShutdown() {
@@ -469,74 +789,5 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     public int getActiveTaskCount() {
         // Count running jobs. If removed, we cannot tell whether the worker is busy or idle.
         return activeTasks.size();
-    }
-
-    // --- Helper Computation Methods ---
-
-    private int computeMax(Object payload) {
-        int max = Integer.MIN_VALUE;
-        for (int num : extractNumbers("MAX", payload)) {
-            if (num > max) {
-                max = num;
-            }
-        }
-        return max == Integer.MIN_VALUE ? 0 : max;
-    }
-
-    private long computePrimeSum(Object payload) {
-        long sum = 0;
-        for (int num : extractNumbers("PRIMESUM", payload)) {
-            if (isPrime(num)) {
-                sum += num;
-            }
-        }
-        return sum;
-    }
-
-    private int computePrimeCount(Object payload) {
-        int count = 0;
-        for (int num : extractNumbers("PRIMECOUNT", payload)) {
-            if (isPrime(num)) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    private List<Integer> extractNumbers(String jobType, Object payload) {
-        List<Integer> list = new ArrayList<>();
-        if (payload instanceof int[]) {
-            int[] arr = (int[]) payload;
-            if (arr.length == 2 && !"MAX".equalsIgnoreCase(jobType)) {
-                int start = arr[0];
-                int end = arr[1];
-                for (int i = start; i <= end; i++) {
-                    list.add(i);
-                }
-            } else {
-                for (int v : arr) {
-                    list.add(v);
-                }
-            }
-        } else if (payload instanceof Integer[]) {
-            for (Integer v : (Integer[]) payload) {
-                if (v != null) list.add(v);
-            }
-        } else if (payload instanceof Collection) {
-            for (Object o : (Collection<?>) payload) {
-                if (o instanceof Number) list.add(((Number) o).intValue());
-            }
-        }
-        return list;
-    }
-
-    private boolean isPrime(int n) {
-        if (n <= 1) return false;
-        if (n <= 3) return true;
-        if (n % 2 == 0 || n % 3 == 0) return false;
-        for (int i = 5; i * i <= n; i += 6) {
-            if (n % i == 0 || n % (i + 2) == 0) return false;
-        }
-        return true;
     }
 }

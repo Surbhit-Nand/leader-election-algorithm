@@ -4,6 +4,7 @@ import com.cs324.common.BootstrapRemote;
 import com.cs324.common.WorkerAddress;
 import com.cs324.common.WorkerRemote;
 
+import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.util.Scanner;
@@ -77,6 +78,9 @@ public class WorkerNode {
                     System.out.println("Peer found but reverse connect failed: " + e.getMessage());
                 }
             }
+            // Start heartbeats: periodically ping the current coordinator via the
+            // bootstrap's address records; a silent coordinator triggers a new election.
+            self.setBootstrapReference(bootstrap[0], myHost);
         } catch (Exception e) {
             System.out.println("Failed to start Worker Node: " + e.getMessage());
             System.exit(1);
@@ -119,8 +123,14 @@ public class WorkerNode {
     private static void runMenu(WorkerRemoteImpl self, int workerId) {
         try (Scanner scanner = new Scanner(System.in)) {
             while (true) {
+                int coordinatorId;
+                try {
+                    coordinatorId = self.getCurrentCoordinatorId();
+                } catch (RemoteException e) {
+                    coordinatorId = -1;
+                }
                 System.out.println();
-                System.out.println("Worker " + workerId + " | coordinator=" + self.getCurrentCoordinatorId()
+                System.out.println("Worker " + workerId + " | coordinator=" + coordinatorId
                         + " | neighbours=" + self.getNeighbourIds());
                 System.out.println("[1] Start Election  [2] Show Leader  [3] Exit");
                 System.out.print("> ");
@@ -133,7 +143,7 @@ public class WorkerNode {
                         long electionId = self.startElection();
                         System.out.println("Election started (messageId=" + electionId + ").");
                     }
-                    case "2" -> System.out.println("Current coordinator: " + self.getCurrentCoordinatorId());
+                    case "2" -> System.out.println("Current coordinator: " + coordinatorId);
                     case "3" -> {
                         System.out.println("Leaving - deregistering from Bootstrap.");
                         return;

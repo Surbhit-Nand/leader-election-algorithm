@@ -1,5 +1,9 @@
 package com.cs324.client;
 
+import com.cs324.common.BootstrapRemote;
+import com.cs324.common.WorkerAddress;
+import com.cs324.common.WorkerRemote;
+import com.cs324.worker.WorkerTaskCalculator;
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.table.DefaultTableModel;
@@ -9,17 +13,29 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.rmi.registry.LocateRegistry;
+import java.rmi.registry.Registry;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import static com.cs324.client.ClientStyle.*;
 
 /**
- * Swing client for preparing MAX, PRIMESUM and PRIMECOUNT input.
- * Flow: enter or load data -> validate it -> add a local preview row.
- * This class does not yet contact a coordinator or calculate job results.
+ * Swing client for preparing and submitting MAX, PRIMESUM and PRIMECOUNT jobs.
+ * Flow: enter or load data -> validate it -> (optional preview) -> submit to
+ * the current coordinator, which splits and aggregates the job, then reports
+ * the final result back here.
+ *
+ * Invocation (all optional): ClientApp [bootstrapHost] [bootstrapPort] [clientRmiPort]
  */
 
 public class ClientApp extends JFrame {
 
     // Colours, rounded panels and icons are defined in ClientStyle.java.
+
+    private final String bootstrapHost;
+    private final int bootstrapPort;
+    private final int clientPort;
 
     // Keep controls as fields so button handlers can read input and update messages.
     private final JComboBox<String> jobTypeBox =
@@ -28,7 +44,14 @@ public class ClientApp extends JFrame {
     private final InputArea inputArea = new InputArea();
     private final JLabel exampleLabel = new JLabel();
     private final JLabel statusLabel =
-            new JLabel("Backend not connected — input preview only");
+            new JLabel("Connecting to coordinator...");
+
+    // Backend references (lazy: resolved on the first submission).
+    private BootstrapRemote bootstrap;
+    private ClientRemoteImpl clientRemote;
+    // Row index in the model of each in-flight (inSubmission) job this window owns.
+    private final ConcurrentHashMap<Integer, Integer> rowByJobId = new ConcurrentHashMap<>();
+    private final AtomicInteger nextJobId = new AtomicInteger(1);
 
     // The model stores preview rows; JTable displays them. Users cannot edit the rows.
     private final DefaultTableModel jobModel = new DefaultTableModel(
@@ -48,9 +71,17 @@ public class ClientApp extends JFrame {
     private final CardLayout historyLayout = new CardLayout();
     private final JPanel historyContent = new JPanel(historyLayout);
 
-    /** Builds the window, arranges its sections and connects controls to handlers. */
-    public ClientApp() {
+    /**
+     * Builds the window, arranges its sections and connects controls to handlers.
+     * @param bootstrapHost host of the Bootstrap node (default localhost)
+     * @param bootstrapPort rmi port of the Bootstrap node (default 1099)
+     * @param clientPort rmi port the client uses to receive job results (default 1199)
+     */
+    public ClientApp(String bootstrapHost, int bootstrapPort, int clientPort) {
         super("CS324 Distributed Job Client");
+        this.bootstrapHost = bootstrapHost;
+        this.bootstrapPort = bootstrapPort;
+        this.clientPort = clientPort;
 
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setMinimumSize(new Dimension(900, 780));
@@ -75,12 +106,12 @@ public class ClientApp extends JFrame {
         heading.add(Box.createVerticalStrut(5));
         heading.add(label("Prepare your data and review computational jobs.", 16, Font.PLAIN, MUTED));
         header.add(heading, BorderLayout.CENTER);
-        JButton mode = button("Preview mode", "eye", false);
+        JButton mode = button("Submit mode", "server", true);
         mode.setFont(BODY.deriveFont(12f));
         mode.setBorder(BorderFactory.createEmptyBorder(7, 12, 7, 12));
         mode.setFocusable(false);
         mode.setCursor(Cursor.getDefaultCursor());
-        mode.setToolTipText("Input previews are available. Backend submission is not connected.");
+        mode.setToolTipText("Submits validated jobs to the current coordinator.");
         JPanel modePanel = transparentPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
         modePanel.add(mode);
         header.add(modePanel, BorderLayout.EAST);
@@ -165,19 +196,26 @@ public class ClientApp extends JFrame {
         // Secondary actions stay on the left; validation is the primary action on the right.
         // Mnemonics provide keyboard shortcuts, such as Alt+L for loading a file on Windows.
         JButton loadCsvButton = button("Load CSV", "folder", false);
-        JButton previewButton = button("Validate & preview", "play", true);
+        JButton previewButton = button("Validate & preview", "play", false);
+        JButton submitButton = button("Submit job", "send", true);
         JButton clearButton = button("Clear input", "trash", false);
         loadCsvButton.setMnemonic('L');
         previewButton.setMnemonic('V');
         clearButton.setMnemonic('C');
+        submitButton.setMnemonic('S');
         previewButton.setToolTipText("Validate input and add a preview. No job is submitted.");
-        JPanel actions = transparentPanel(new BorderLayout());
+        submitButton.setToolTipText("Validate input and submit the job to the current coordinator.");
+        JPanel actions = transparentPanel(new BorderLayout(10, 0));
         JPanel secondaryActions = transparentPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         secondaryActions.add(loadCsvButton);
         secondaryActions.add(Box.createHorizontalStrut(10));
         secondaryActions.add(clearButton);
         actions.add(secondaryActions, BorderLayout.WEST);
-        actions.add(previewButton, BorderLayout.EAST);
+        JPanel primaryActions = transparentPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        primaryActions.add(previewButton);
+        primaryActions.add(Box.createHorizontalStrut(10));
+        primaryActions.add(submitButton);
+        actions.add(primaryActions, BorderLayout.EAST);
         composer.add(actions, BorderLayout.SOUTH);
         workspace.add(composer, BorderLayout.NORTH);
 
@@ -295,8 +333,8 @@ public class ClientApp extends JFrame {
         statusLabel.setIconTextGap(8);
         JPanel footer = transparentPanel(new BorderLayout(16, 0));
         footer.add(statusLabel, BorderLayout.CENTER);
-        JLabel connectionHint = label("Preview only. Results require a backend connection.",
-                12, Font.PLAIN, MUTED);
+JLabel connectionHint = label("Jobs run on the worker cluster; results return here.",
+        12, Font.PLAIN, MUTED);
         connectionHint.setIcon(icon("info", 17, MUTED));
         connectionHint.setIconTextGap(7);
         footer.add(connectionHint, BorderLayout.EAST);
@@ -307,6 +345,7 @@ public class ClientApp extends JFrame {
         jobTypeBox.addActionListener(event -> updateExample());
         loadCsvButton.addActionListener(event -> loadCsv());
         previewButton.addActionListener(event -> previewJob());
+        submitButton.addActionListener(event -> submitJob());
         clearButton.addActionListener(event -> {
             inputArea.setText("");
             statusLabel.setText("Input cleared. Your previews are retained.");
@@ -530,6 +569,168 @@ public class ClientApp extends JFrame {
         }
     }
 
+    /**
+     * Lazily contacts the Bootstrap node and binds this client's result channel
+     * (ClientRemote) on its own registry so coordinators can report back.
+     */
+    private void connectBackend() throws Exception {
+        if (bootstrap != null) {
+            return;
+        }
+        Registry clientRegistry = LocateRegistry.createRegistry(clientPort);
+        clientRemote = new ClientRemoteImpl((jobId, result) ->
+                SwingUtilities.invokeLater(() -> onResult(jobId, result)));
+        clientRegistry.rebind("Client", clientRemote);
+
+        Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
+        bootstrap = (BootstrapRemote) bootstrapRegistry.lookup("BootstrapRegistry");
+    }
+
+    /**
+     * Finds the current coordinator. If no worker knows one yet, it asks the
+     * first active worker to start an election and polls until the result
+     * propagates through coordinator announcements.
+     */
+    private WorkerRemote discoverCoordinator() throws Exception {
+        for (int attempt = 0; attempt < 6; attempt++) {
+            List<Integer> ids = bootstrap.getActiveWorkerIds();
+            if (ids == null || ids.isEmpty()) {
+                Thread.sleep(1000);
+                continue;
+            }
+            for (Integer wid : ids) {
+                WorkerAddress address = bootstrap.getWorkerAddress(wid);
+                if (address == null) {
+                    continue;
+                }
+                WorkerRemote candidate = lookupWorker(wid, address);
+                if (candidate == null) {
+                    continue;
+                }
+                int coordinatorId = candidate.getCurrentCoordinatorId();
+                if (coordinatorId != -1) {
+                    WorkerAddress coordAddress = bootstrap.getWorkerAddress(coordinatorId);
+                    if (coordAddress != null) {
+                        WorkerRemote coordinator = lookupWorker(coordinatorId, coordAddress);
+                        if (coordinator != null) {
+                            return coordinator;
+                        }
+                    }
+                }
+            }
+            // No elected coordinator yet: trigger an election from the first live worker.
+            if (!ids.isEmpty()) {
+                Integer first = ids.get(0);
+                WorkerAddress anyAddress = bootstrap.getWorkerAddress(first);
+                WorkerRemote any = anyAddress != null ? lookupWorker(first, anyAddress) : null;
+                if (any != null) {
+                    try {
+                        any.startElection();
+                    } catch (Exception ignored) {
+                        // the worker may have died between lookup and call
+                    }
+                }
+            }
+            Thread.sleep(1200);
+        }
+        return null;
+    }
+
+    private WorkerRemote lookupWorker(int workerId, WorkerAddress address) {
+        try {
+            Registry registry = LocateRegistry.getRegistry(address.getRmiHost(), address.getRmiPort());
+            return (WorkerRemote) registry.lookup("Worker" + workerId);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Builds the RMI payload: PrimeRange for PRIMESUM, int[] lists otherwise. */
+    private Object buildPayload(String operation, long[] values) {
+        if ("PRIMESUM".equals(operation)) {
+            return new WorkerTaskCalculator.PrimeRange(
+                    Math.toIntExact(values[0]), Math.toIntExact(values[1]));
+        }
+        int[] result = new int[values.length];
+        for (int i = 0; i < values.length; i++) {
+            result[i] = Math.toIntExact(values[i]);
+        }
+        return result;
+    }
+
+    /**
+     * Validates the current input and submits it to the current coordinator
+     * on a background thread (never blocks the EDT). The coordinator splits
+     * the job among itself and its neighbours, then calls back with the
+     * aggregated result.
+     */
+    private void submitJob() {
+        long[] values;
+        String operation;
+        Object payload;
+        try {
+            values = parseInput(inputArea.getText());
+            operation = (String) jobTypeBox.getSelectedItem();
+            // Math.toIntExact rejects values outside the 32-bit range.
+            payload = buildPayload(operation, values);
+        } catch (IllegalArgumentException | ArithmeticException exception) {
+            showError(exception.getMessage());
+            return;
+        }
+
+        String inputSummary = "PRIMESUM".equals(operation)
+                ? values[0] + " to " + values[1]
+                : values.length + " numbers";
+        int jobId = nextJobId.getAndIncrement();
+        String ref = "Job-" + jobId;
+
+        final String op = operation;
+        final Object finalPayload = payload;
+        statusLabel.setText("Contacting coordinator...");
+
+        new Thread(() -> {
+            try {
+                connectBackend();
+                WorkerRemote coordinator = discoverCoordinator();
+                if (coordinator == null) {
+                    SwingUtilities.invokeLater(() -> statusLabel.setText(
+                            "No coordinator found. Are workers running?"));
+                    return;
+                }
+                // The submitted row reflects the real job state; previews stay as-is.
+                final int modelRow = jobModel.getRowCount();
+                final int coordinatorId = coordinator.getId();
+                rowByJobId.put(jobId, modelRow);
+                SwingUtilities.invokeLater(() -> {
+                    jobModel.addRow(new Object[]{ref, op, inputSummary,
+                            "Submitted to coordinator " + coordinatorId, "Running"});
+                    historyLayout.show(historyContent, "table");
+                    previewCount.setText(jobModel.getRowCount()
+                            + (jobModel.getRowCount() == 1 ? " job" : " jobs"));
+                    statusLabel.setText("Job " + ref + " submitted to the coordinator.");
+                });
+                coordinator.submitJob(jobId, op, finalPayload, "localhost", clientPort, "Client");
+            } catch (Exception exception) {
+                SwingUtilities.invokeLater(() -> statusLabel.setText(
+                        "Submission failed: " + exception.getMessage()));
+            }
+        }).start();
+    }
+
+    /** Updates the matching row once the coordinator returns the aggregated result. */
+    private void onResult(int jobId, Object result) {
+        Integer row = rowByJobId.get(jobId);
+        if (row == null) {
+            return;
+        }
+        if (row >= 0 && row < jobModel.getRowCount()) {
+            jobModel.setValueAt("Completed", row, 3);
+            jobModel.setValueAt(String.valueOf(result), row, 4);
+        }
+        rowByJobId.remove(jobId);
+        statusLabel.setText("Job " + jobId + " completed with result: " + result);
+    }
+
     /** Displays validation and file-reading errors in a dialog attached to this window. */
     private void showError(String message) {
         JOptionPane.showMessageDialog(
@@ -541,10 +742,17 @@ public class ClientApp extends JFrame {
     }
 
     public static void main(String[] args) {
+        // Optional args: ClientApp [bootstrapHost] [bootstrapPort] [clientRmiPort].
+        String bootstrapHost = args.length > 0 ? args[0] : "localhost";
+        int bootstrapPort = args.length > 1 ? Integer.parseInt(args[1]) : 1099;
+        int clientPort = args.length > 2 ? Integer.parseInt(args[2]) : 1199;
         // Create Swing components on the Event Dispatch Thread, which handles UI events.
         // Future network calls and long calculations must run elsewhere to avoid freezing it.
+        final String host = bootstrapHost;
+        final int bPort = bootstrapPort;
+        final int cPort = clientPort;
         SwingUtilities.invokeLater(
-                () -> new ClientApp().setVisible(true)
+                () -> new ClientApp(host, bPort, cPort).setVisible(true)
         );
     }
 }

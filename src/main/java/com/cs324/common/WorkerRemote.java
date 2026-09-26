@@ -15,6 +15,21 @@ public interface WorkerRemote extends Remote {
 
     boolean isActive() throws RemoteException;
 
+    // Current known coordinator id (-1 if none has been elected yet).
+    int getCurrentCoordinatorId() throws RemoteException;
+
+    // Starts a new election wave; returns the unique message id used.
+    long startElection() throws RemoteException;
+
+    // Heartbeat probe: succeeds as long as this worker's JVM is responsive.
+    void ping() throws RemoteException;
+
+    // Called by a Client: the current coordinator splits the payload among
+    // itself and its neighbours, then reports the aggregated result back to
+    // the client's ClientRemote object (host/port/name).
+    void submitJob(int jobId, String jobType, Object payload,
+                   String clientHost, int clientPort, String clientName) throws RemoteException;
+
     // Called by a neighbour to propagate an ELECTION message.
     // originId/messageId let the receiver detect and drop duplicates.
     void receiveElectionMessage(int originId, int candidateId, int candidateJac, long messageId) throws RemoteException;

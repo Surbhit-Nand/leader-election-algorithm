@@ -173,8 +173,10 @@ It supports manual input, numeric CSV loading, input validation, and clearing
 input without removing previous previews. `ClientApp.java` handles the interface
 and input; `ClientStyle.java` contains the styling helpers.
 
-The GUI currently validates and previews jobs only. Backend submission and
-displaying computation results are still pending.
+The GUI validates and previews jobs, and can now submit them to the current
+coordinator: it discovers the coordinator through the Bootstrap node, submits
+MAX/PRIMESUM/PRIMECOUNT jobs (PrimeRange payloads for PRIMESUM), and fills in
+the result cell once the coordinator delivers the aggregated answer.
 
 ## Computation
 
@@ -204,9 +206,11 @@ Empty prime lists return zero; an empty MAX list is rejected. Use 32-bit integer
 decimal values and `long` inputs are rejected rather than silently converted.
 Very wide ranges can still be slow.
 
-The calculator is not connected to worker execution yet. Its explicit range format
-replaces the worker's old two-value-array rule; future integration must update
-range payloads to `PrimeRange`.
+The calculator is wired into worker execution: `WorkerRemoteImpl` delegates to
+`WorkerTaskCalculator` in `assignTask()`. Job submission (`submitJob()`) splits
+the payload into `PrimeRange` segments or `int[]` slices across the coordinator
+and its neighbours, aggregates the sub-results on the coordinator, and delivers
+the final value back to the client's `ClientRemote`.
 
 Run its tests:
 

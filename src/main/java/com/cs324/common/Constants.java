@@ -13,4 +13,7 @@ public class Constants {
 
     // Coordinator serves for a term of 5 job assignments before re-election
     public static final int JOBS_PER_TERM = 5;
+
+    // How often workers probe their current coordinator (heartbeat)
+    public static final int HEARTBEAT_INTERVAL_MS = 2000;
 }
