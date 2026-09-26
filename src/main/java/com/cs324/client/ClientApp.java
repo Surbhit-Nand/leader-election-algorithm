@@ -13,6 +13,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.util.List;
@@ -691,25 +692,56 @@ JLabel connectionHint = label("Jobs run on the worker cluster; results return he
         new Thread(() -> {
             try {
                 connectBackend();
-                WorkerRemote coordinator = discoverCoordinator();
-                if (coordinator == null) {
+
+                // Discover the coordinator and submit, retrying a couple of times
+                // in case the submit lands on a coordinator mid-rotation. Stale
+                // coordinators throw "not the current coordinator", which is
+                // transient: a fresh discovery resolves the new one.
+                int coordinatorId = -1;
+                Exception lastError = null;
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    try {
+                        WorkerRemote coordinator = discoverCoordinator();
+                        if (coordinator == null) {
+                            lastError = new RemoteException("no coordinator found - are workers running?");
+                            Thread.sleep(500);
+                            continue;
+                        }
+                        coordinatorId = coordinator.getId();
+                        coordinator.submitJob(jobId, op, finalPayload, "localhost", clientPort, "Client");
+                        break;
+                    } catch (RemoteException e) {
+                        lastError = e;
+                        Thread.sleep(500);
+                    } catch (Exception e) {
+                        lastError = e;
+                        break; // discovery/host failure is unlikely to resolve on retry
+                    }
+                }
+
+                if (coordinatorId == -1) {
+                    final String failMessage = lastError != null ? lastError.getMessage() : "unknown error";
                     SwingUtilities.invokeLater(() -> statusLabel.setText(
-                            "No coordinator found. Are workers running?"));
+                            "Job " + ref + " failed: " + failMessage));
                     return;
                 }
-                // The submitted row reflects the real job state; previews stay as-is.
-                final int modelRow = jobModel.getRowCount();
-                final int coordinatorId = coordinator.getId();
-                rowByJobId.put(jobId, modelRow);
+
+                // The row is added on the EDT and the jobId->row mapping is recorded
+                // there too, right after addRow: a result callback (also queued on the
+                // EDT, and only after the submit RMI returned) is always processed
+                // after this mapping exists, so concurrent submissions stay on their
+                // own row.
+                final int submittedCoordinatorId = coordinatorId;
                 SwingUtilities.invokeLater(() -> {
                     jobModel.addRow(new Object[]{ref, op, inputSummary,
-                            "Submitted to coordinator " + coordinatorId, "Running"});
+                            "Submitted to coordinator " + submittedCoordinatorId, "Running"});
+                    int row = jobModel.getRowCount() - 1;
+                    rowByJobId.put(jobId, row);
                     historyLayout.show(historyContent, "table");
                     previewCount.setText(jobModel.getRowCount()
                             + (jobModel.getRowCount() == 1 ? " job" : " jobs"));
                     statusLabel.setText("Job " + ref + " submitted to the coordinator.");
                 });
-                coordinator.submitJob(jobId, op, finalPayload, "localhost", clientPort, "Client");
             } catch (Exception exception) {
                 SwingUtilities.invokeLater(() -> statusLabel.setText(
                         "Submission failed: " + exception.getMessage()));
