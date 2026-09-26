@@ -718,7 +718,6 @@ SwingUtilities.invokeLater(() -> {
             "Job " + jobId + " submitted to the coordinator."
     );
 });
-                });
             } catch (Exception exception) {
                 String message = exception.getMessage() == null
                         ? exception.getClass().getSimpleName()
