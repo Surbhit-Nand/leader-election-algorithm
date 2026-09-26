@@ -1,15 +1,26 @@
 package com.cs324.test;
 
 import com.cs324.worker.WorkerRemoteImpl;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.rmi.NoSuchObjectException;
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.rmi.registry.LocateRegistry;
+import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -22,25 +33,98 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * A lone worker has no neighbours, so there is nothing to wait for: the election
  * must resolve immediately to itself.
  *
- * These tests need no registry or peers - startElection on a worker with no
- * neighbours is entirely local.
+ * Most of these need no registry or peers - startElection on a worker with no
+ * neighbours is entirely local. The one exception is the fan-out test, which
+ * needs a real registry to hand out RMI stubs for the neighbours, because
+ * "did the neighbour really receive it over RMI?" is the whole point of it.
  */
 class WorkerStartElectionTest {
+
+    private static final int TEST_RMI_PORT = 19807;
+    private static final String HOST = "localhost";
 
     /** How many back-to-back elections to start when checking that ids do not repeat. */
     private static final int RAPID_ELECTIONS = 100;
 
+    private static Registry registry;
+
     private WorkerRemoteImpl worker;
+    private WorkerRemoteImpl otherWorker;
+    private RecordingWorkerRemote neighbourTwo;   // id 2 - records what worker 1 sends it
+    private RecordingWorkerRemote neighbourThree; // id 3 - records what worker 1 sends it
+
+    @BeforeAll
+    static void startRegistry() throws RemoteException {
+        registry = LocateRegistry.createRegistry(TEST_RMI_PORT);
+    }
+
+    @AfterAll
+    static void stopRegistry() throws Exception {
+        UnicastRemoteObject.unexportObject(registry, true);
+    }
 
     @AfterEach
     void tearDown() throws Exception {
-        if (worker != null) {
-            try {
-                UnicastRemoteObject.unexportObject(worker, true);
-            } catch (NoSuchObjectException ignored) {
-                // already unexported, nothing to do
-            }
+        for (String name : registry.list()) {
+            registry.unbind(name);
         }
+        unexportQuietly(worker);
+        unexportQuietly(otherWorker);
+        unexportQuietly(neighbourTwo);
+        unexportQuietly(neighbourThree);
+    }
+
+    private void unexportQuietly(Remote remoteObject) {
+        if (remoteObject == null) {
+            return;
+        }
+        try {
+            UnicastRemoteObject.unexportObject(remoteObject, true);
+        } catch (NoSuchObjectException ignored) {
+            // already unexported, nothing to do
+        }
+    }
+
+    /**
+     * Gives a worker a starting Job Allocation Counter.
+     *
+     * Reflection is used deliberately: there is no public way to arrange JAC
+     * values yet, and driving it through assignTask() would tie this test to
+     * wherever that increment currently lives - which is exactly the thing that
+     * is expected to move. Replace this helper once a proper seam exists.
+     */
+    private static void seedJobAllocationCounter(WorkerRemoteImpl worker, int value) throws Exception {
+        Field field = WorkerRemoteImpl.class.getDeclaredField("jobAllocationCounter");
+        field.setAccessible(true);
+        ((AtomicInteger) field.get(worker)).set(value);
+    }
+
+    private static Set<Long> seenMessageIds(WorkerRemoteImpl worker) throws Exception {
+        Field field = WorkerRemoteImpl.class.getDeclaredField("seenMessageIds");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Set<Long> ids = (Set<Long>) field.get(worker);
+        return ids;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<Long, Object> electionsOf(WorkerRemoteImpl worker) throws Exception {
+        Field field = WorkerRemoteImpl.class.getDeclaredField("elections");
+        field.setAccessible(true);
+        return (Map<Long, Object>) field.get(worker);
+    }
+
+    /**
+     * Reads one int off an ElectionState.
+     *
+     * ElectionState is a private nested class, so the field is looked up on the
+     * value's own runtime class. This is inspection only - nothing here is used
+     * to arrange state for the code under test.
+     */
+    private static int readElectionInt(Object electionState, String fieldName) throws Exception {
+        Field field = electionState.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return (Integer) field.get(electionState);
     }
 
     @Test
@@ -66,5 +150,71 @@ class WorkerStartElectionTest {
         assertEquals(RAPID_ELECTIONS, ids.size(),
                 "every election must get a unique id - if two share one, every other worker drops the second as a "
                         + "duplicate and the re-election after a coordinator's term silently never happens");
+    }
+
+    @Test
+    void differentWorkersGenerateDifferentElectionIds() throws Exception {
+        worker = new WorkerRemoteImpl(4);
+        otherWorker = new WorkerRemoteImpl(5);
+
+        long firstId = worker.startElection();
+        long secondId = otherWorker.startElection();
+
+        assertNotEquals(firstId, secondId,
+                "two different workers must not pick the same election id - they may be holding the same election at "
+                        + "the same time, and one would be discarded as a duplicate of the other, so its subtree "
+                        + "never echoes back and the two workers never agree on a coordinator");
+    }
+
+    @Test
+    void startElectionInitializesElectionState() throws Exception {
+        int initiatorId = 7;
+        int startingJac = 3;
+        worker = new WorkerRemoteImpl(initiatorId);
+        seedJobAllocationCounter(worker, startingJac);
+
+        long messageId = worker.startElection();
+
+        assertTrue(seenMessageIds(worker).contains(messageId),
+                "the initiator has processed its own election, so it must record the id as seen - otherwise the "
+                        + "election echoed back around a cycle would look new to it and be processed a second time");
+
+        Object election = electionsOf(worker).get(messageId);
+        assertNotNull(election, "startElection must register an election under the id it returns; known ids: "
+                + electionsOf(worker).keySet());
+
+        assertEquals(initiatorId, readElectionInt(election, "parentId"),
+                "the initiator is its own parent - a state pointing anywhere else makes the echo phase send its "
+                        + "result to a neighbour that never asked for it, and the coordinator is never announced");
+        assertEquals(initiatorId, readElectionInt(election, "bestCandidateId"),
+                "the initiator is the first candidate it has seen, so it starts as its own best candidate");
+        assertEquals(startingJac, readElectionInt(election, "bestCandidateJac"),
+                "the election must start from the worker's actual JAC ("
+                        + startingJac + ") - defaulting to 0 would give a busy worker a free pass to win every "
+                        + "election it starts, and the whole JAC comparison in the echo phase would be decided "
+                        + "against a number the worker never had");
+    }
+
+    @Test
+    void startElectionSendsElectionToEveryNeighbour() throws Exception {
+        worker = new WorkerRemoteImpl(1);
+        neighbourTwo = new RecordingWorkerRemote(2);
+        neighbourThree = new RecordingWorkerRemote(3);
+
+        registry.rebind("Worker2", neighbourTwo);
+        registry.rebind("Worker3", neighbourThree);
+
+        worker.connectAsNeighbour(2, HOST, TEST_RMI_PORT);
+        worker.connectAsNeighbour(3, HOST, TEST_RMI_PORT);
+
+        long messageId = worker.startElection();
+
+        assertTrue(neighbourTwo.receivedElection(1, messageId),
+                "an initiator must tell every neighbour it is standing for election - if worker 2 is skipped it "
+                        + "never learns about the election, never echoes back, and worker 1 waits on it forever, so "
+                        + "no coordinator is ever decided; recorded: " + neighbourTwo.calls());
+        assertTrue(neighbourThree.receivedElection(1, messageId),
+                "the ELECTION must carry the id startElection returned, so the echo that comes back can be matched "
+                        + "to this election; recorded: " + neighbourThree.calls());
     }
 }

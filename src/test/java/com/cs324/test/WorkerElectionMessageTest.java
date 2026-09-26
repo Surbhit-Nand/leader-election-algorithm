@@ -33,6 +33,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * waiting for our reply, so a duplicate still has to be ANSWERED, or two nodes
  * that forwarded to each other simply wait forever. These tests pin down both
  * halves.
+ *
+ * That duplicate does not have to arrive from the same neighbour that sent the
+ * first copy - a cycle in the network hands it back by a different path, which
+ * is also the one case where rule 1 on its own would forward the election to the
+ * node that has already sent it. The answer has to go to whoever sent this copy.
  */
 class WorkerElectionMessageTest {
 
@@ -116,6 +121,37 @@ class WorkerElectionMessageTest {
         assertEquals(1L, countOf(sender.calls(), "echo|"),
                 "a duplicate must still be answered with exactly one echo - dropping it silently leaves the "
                         + "forwarding node waiting forever, which deadlocks any network containing a cycle; "
+                        + "recorded: " + sender.calls());
+    }
+
+    @Test
+    void duplicateElectionFromDifferentNeighbourIsNotForwardedAgainAndIsEchoedBack() throws Exception {
+        // First copy, arriving from worker 2, so it goes on to worker 3.
+        worker.receiveElectionMessage(2, 2, 0, ELECTION_ID);
+
+        assertEquals(1L, countOf(other.calls(), "election|"),
+                "the first copy must be passed on to the neighbours other than the one it came from; recorded: "
+                        + other.calls());
+
+        // Same election id, but arriving from the OTHER neighbour. In a network
+        // with a cycle this is the election coming back round by a different
+        // path, and it is the case rule 1 alone would get wrong: "forward to
+        // every neighbour except the sender" now means forwarding to worker 2,
+        // the node that has already sent us this exact election.
+        worker.receiveElectionMessage(3, 3, 0, ELECTION_ID);
+
+        assertEquals(1L, countOf(other.calls(), "election|"),
+                "a duplicate must not start a second propagation, however it reached us; recorded: "
+                        + other.calls());
+        assertEquals(1L, countOf(other.calls(), "echo|"),
+                "the neighbour that forwarded the duplicate is now waiting on our reply, so it must be answered "
+                        + "exactly once; recorded: " + other.calls());
+        assertTrue(other.receivedEcho(1, ELECTION_ID),
+                "the echo has to be attributed to this node and this election, or the duplicate's sender cannot "
+                        + "match it to the election it is waiting on; recorded: " + other.calls());
+        assertEquals(0L, countOf(sender.calls(), "election|"),
+                "the election must not be sent back to worker 2, which is where it came from and where the duplicate "
+                        + "would send it next - that just keeps the election circulating around the cycle forever; "
                         + "recorded: " + sender.calls());
     }
 
