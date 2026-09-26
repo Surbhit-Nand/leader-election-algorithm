@@ -168,15 +168,16 @@ These are settled interpretations of ambiguous spec points. Keep implementations
 
 ## Updated GUI
 
-The client now has rounded panels, blue buttons, icons, and a job preview table.
+The client now has rounded panels, blue buttons, icons, and a job-history table.
 It supports manual input, numeric CSV loading, input validation, and clearing
-input without removing previous previews. `ClientApp.java` handles the interface
-and input; `ClientStyle.java` contains the styling helpers.
+input without removing the submitted-job history. `ClientApp.java` handles the
+interface and input; `ClientStyle.java` contains the styling helpers.
 
-The GUI validates and previews jobs, and can now submit them to the current
-coordinator: it discovers the coordinator through the Bootstrap node, submits
-MAX/PRIMESUM/PRIMECOUNT jobs (PrimeRange payloads for PRIMESUM), and fills in
-the result cell once the coordinator delivers the aggregated answer.
+The GUI validates and submits jobs to the current coordinator: it requests a
+cluster-wide job ID from the Bootstrap node, discovers the coordinator through
+it, submits MAX/PRIMESUM/PRIMECOUNT jobs (PrimeRange payloads for PRIMESUM), and
+fills in the result cell once the coordinator delivers the aggregated answer.
+If the coordinator rotates mid-submit it discovers the new one and retries.
 
 ## Computation
 
