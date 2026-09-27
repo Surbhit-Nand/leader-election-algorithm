@@ -654,6 +654,11 @@ public class ClientApp extends JFrame {
 
                 // Discover the coordinator and retry submission if needed.
                 int coordinatorId = -1;
+                // A discovered coordinator id only proves we found a leader, not
+                // that it accepted the job: submitJob() throws when the node is no
+                // longer the coordinator. Track acceptance separately so an
+                // exhausted retry loop reports failure instead of "Running".
+                boolean accepted = false;
                 Exception lastError = null;
 
                 for (int attempt = 0; attempt < 3; attempt++) {
@@ -678,6 +683,7 @@ public class ClientApp extends JFrame {
                                 "Client"
                         );
 
+                        accepted = true;
                         break;
 
                     } catch (RemoteException e) {
@@ -690,7 +696,7 @@ public class ClientApp extends JFrame {
                     }
                 }
 
-                if (coordinatorId == -1) {
+                if (!accepted) {
                     final String failMessage =
                             lastError != null && lastError.getMessage() != null
                                     ? lastError.getMessage()
