@@ -133,6 +133,13 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     // than per assignment, so a term's length does not depend on how many
     // workers the cluster has. Reset whenever this node becomes the coordinator.
     private final AtomicInteger termJobsCoordinated = new AtomicInteger(0);
+    // Set while this node is yielding leadership after a spent term. The job
+    // budget is already reset to 0 at that point, but currentCoordinatorId
+    // still names this node until the election concludes - so without this flag
+    // a job arriving in that window would pass the coordinator check and start
+    // a fresh budget inside a term the spec has already spent. Cleared when a
+    // coordinator announcement arrives or when this node learns the wave outcome.
+    private final AtomicBoolean handoverInProgress = new AtomicBoolean(false);
 
     public WorkerRemoteImpl(int id) throws RemoteException {
         super();
@@ -323,8 +330,14 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
         // Record the winner. Volatile write = all threads see it at once.
         this.currentCoordinatorId = coordinatorId;
+        // An election has concluded, so any handover this node started is over.
+        handoverInProgress.set(false);
         // A new term begins whenever this node is named coordinator, so the
         // job budget restarts rather than carrying over from an earlier term.
+        // Every announcement that reaches a node now originates in a concluded
+        // election: a joining worker adopts locally instead of relaying, and the
+        // announcing node records the id before broadcasting, so a fresh id here
+        // means a genuinely new term rather than a repeat of the current one.
         if (coordinatorId == this.id) {
             termJobsCoordinated.set(0);
         }
@@ -337,6 +350,29 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
             try {
                 entry.getValue().receiveCoordinatorMessage(coordinatorId, messageId);
             } catch (RemoteException ignored) {}
+        }
+    }
+
+    /**
+     * Adopts a coordinator the cluster already elected, locally only.
+     *
+     * <p>A joining worker learns the current coordinator from a single peer and
+     * must not re-broadcast it: that peer already knows, and a relay would reach
+     * the coordinator under a fresh message id, which reads as a brand new term
+     * and hands the serving coordinator a second full job budget mid-term. Only
+     * a concluded election may start a new term, so adoption is deliberately not
+     * routed through the relaying {@link #receiveCoordinatorMessage}.
+     *
+     * <p>Not on {@link WorkerRemote}: it is a local call on this object, so the
+     * RMI interface and wire protocol are unchanged.
+     */
+    public void adoptCoordinator(int coordinatorId, long messageId) {
+        // Recorded so a later announcement carrying this same local id is
+        // recognised as already seen.
+        seenCoordinatorMessageIds.add(messageId);
+        this.currentCoordinatorId = coordinatorId;
+        if (coordinatorId == this.id) {
+            termJobsCoordinated.set(0);
         }
     }
 
@@ -386,6 +422,8 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         if (election.parentId == this.id) {
             // Save the winner locally.
             this.currentCoordinatorId = election.bestCandidateId;
+            // The wave finished, so any handover this node started is over.
+            handoverInProgress.set(false);
             // Re-electing ourselves (a lone worker, or one whose peers all left)
             // is a fresh term, so the job budget restarts.
             if (election.bestCandidateId == this.id) {
@@ -393,6 +431,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
             }
             // Coordinator announcement ID derived from the election ID.
             long coordMessageId = messageId + 1000000L;
+            // Record it before broadcasting. Announcements travel in every
+            // direction, so without this the initiator meets its own broadcast
+            // coming back, treats it as new, and if it won, restarts its term
+            // budget a second time and relays the announcement again.
+            seenCoordinatorMessageIds.add(coordMessageId);
             // Snapshot of neighbours for the broadcast.
             List<Map.Entry<Integer, WorkerRemote>> snapshot = new ArrayList<>(neighbours.entrySet());
             // Announce the winner to all neighbours.
@@ -546,6 +589,12 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     public void submitJob(int jobId, String jobType, Object payload, String clientHost, int clientPort, String clientName) throws RemoteException {
         if (currentCoordinatorId != id) {
             throw new RemoteException("Worker " + id + " is not the current coordinator (coordinator=" + currentCoordinatorId + ")");
+        }
+        // A spent term is refused from the moment its budget is reset until the
+        // handover completes, so no job can slip into a term the spec has
+        // already spent. Retryable: the client re-discovers the coordinator.
+        if (handoverInProgress.get()) {
+            throw new RemoteException("Worker " + id + " is handing over leadership after a spent term; retry against the new coordinator");
         }
         // Use bootstrap to find all registered workers without adding election
         // neighbours. Tests without bootstrap retain their directly connected peers.
@@ -743,6 +792,10 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 return;
             }
             if (termJobsCoordinated.compareAndSet(used, 0)) {
+                // Close the handover window before the wave starts: from here
+                // until a coordinator is announced this node is no longer a
+                // valid destination for work, despite still being named.
+                handoverInProgress.set(true);
                 startElection();
                 return;
             }

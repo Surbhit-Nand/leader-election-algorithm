@@ -23,6 +23,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
@@ -332,6 +333,178 @@ class WorkerDispatchTest {
     }
 
     @Test
+    void aTermRefusesAJobWhileLeadershipIsBeingHandedOver() throws Exception {
+        BlockingAssignWorkerRemote stalled2 = installBlockingParticipant(2);
+        installBlockingParticipant(3);
+
+        // Five accepted jobs spend the term and the fifth starts the handover.
+        // These participants answer an election by recording it and never echo
+        // it, so the wave never concludes: the budget has already been reset to
+        // zero while this node is still the named coordinator. That is the
+        // window a sixth job used to walk straight into, because the only thing
+        // guarding submitJob was the coordinator id, and that still read "me".
+        for (int job = 601; job <= 605; job++) {
+            w1.submitJob(job, "MAX", new int[]{job, job + 1, 7}, HOST, TEST_RMI_PORT, CLIENT_NAME);
+        }
+
+        assertEquals(0, w1.getJobsCoordinatedInTerm(),
+                "the fifth job spends the term and resets the budget");
+        assertEquals(1, w1.getCurrentCoordinatorId(),
+                "the wave has stalled, so this node is still named coordinator");
+        assertTrue(countCalls(stalled2.calls(), "election|") >= 1,
+                "the fifth job should have started the handover election; recorded on worker 2: "
+                        + stalled2.calls());
+
+        RemoteException refusal = assertThrows(RemoteException.class, () ->
+                        w1.submitJob(606, "MAX", new int[]{606, 607, 7}, HOST, TEST_RMI_PORT, CLIENT_NAME),
+                "a job arriving mid-handover must not be accepted into the term that has just ended");
+        assertTrue(String.valueOf(refusal.getMessage()).contains("handing over"),
+                "the refusal should say a handover is in progress, got: " + refusal.getMessage());
+        assertEquals(0, w1.getJobsCoordinatedInTerm(),
+                "a refused job must not consume any of the incoming term's budget");
+    }
+
+    @Test
+    void aJoiningWorkerDoesNotResetTheServingCoordinatorsTerm() throws Exception {
+        // Four accepted jobs: this term is part-way through its budget, which is
+        // exactly the state a second budget must not be handed out in.
+        for (int job = 701; job <= 704; job++) {
+            w1.submitJob(job, "MAX", new int[]{job, job + 1, 7}, HOST, TEST_RMI_PORT, CLIENT_NAME);
+        }
+        assertEquals(4, w1.getJobsCoordinatedInTerm(), "four jobs leave this term part-spent");
+
+        // A worker joining an existing cluster adopts the leader its peer already
+        // knows - WorkerNode calls adoptCoordinator, which is local-only. A joiner
+        // is wired to a single peer, and that peer already knows the coordinator,
+        // so re-broadcasting it reaches the serving coordinator under a fresh
+        // message id, which it cannot tell from a new term: it restarted its
+        // budget and served nine jobs in one term instead of five.
+        WorkerRemoteImpl joiner = new WorkerRemoteImpl(9);
+        registry.rebind("Worker9", joiner);
+        joiner.connectAsNeighbour(1, HOST, TEST_RMI_PORT);
+        try {
+            joiner.adoptCoordinator(1, 900L);
+
+            assertEquals(1, joiner.getCurrentCoordinatorId(),
+                    "the joiner should adopt the coordinator it was told about");
+            assertEquals(4, w1.getJobsCoordinatedInTerm(),
+                    "a joiner adopting the current coordinator must not restart the term it is joining");
+        } finally {
+            joiner.shutdown();
+            unexportQuietly(joiner);
+        }
+    }
+
+    @Test
+    void adoptingACoordinatorIsNotRelayedToNeighbours() throws Exception {
+        RecordingWorkerRemote peer = new RecordingWorkerRemote(8);
+        registry.rebind("Worker8", peer);
+
+        WorkerRemoteImpl joiner = new WorkerRemoteImpl(9);
+        registry.rebind("Worker9", joiner);
+        joiner.connectAsNeighbour(8, HOST, TEST_RMI_PORT);
+        try {
+            joiner.adoptCoordinator(8, 900L);
+
+            assertEquals(8, joiner.getCurrentCoordinatorId(), "the joiner should know the coordinator");
+            assertEquals(0, countCalls(peer.calls(), "coordinator|"),
+                    "adoption is local: the peer it learned from already knows this coordinator, so "
+                            + "relaying would only spread an announcement nobody needs; recorded on worker 8: "
+                            + peer.calls());
+        } finally {
+            joiner.shutdown();
+            unexportQuietly(joiner);
+            unexportQuietly(peer);
+        }
+    }
+
+    @Test
+    void aReservationRacingARotationKeepsTheTermBudgetInRange() throws Exception {
+        // reserveTermSlot and maybeRotateCoordinator are private, and the state
+        // they race over is not reachable from outside, so both are driven here.
+        //
+        // The CAS keeps the budget inside [0, JOBS_PER_TERM] at every instant: a
+        // reservation can only move the counter from a value it has already
+        // checked to be under the cap, so the counter is never observable above
+        // the cap, and a refused reservation never has to undo anything - so
+        // there is no late decrement that could land after a rotation has already
+        // reset the counter and drive it below zero. An increment-then-check
+        // scheme breaks both halves of that: it publishes the over-cap value for
+        // as long as the check takes, and its undo can land out of order.
+        final int reservers = 4;
+        final int rotators = 2;
+        final int iterations = 4000;
+
+        setTermCount(w1, 0);
+        AtomicBoolean stop = new AtomicBoolean(false);
+        AtomicInteger highest = new AtomicInteger(0);
+        AtomicInteger lowest = new AtomicInteger(Constants.JOBS_PER_TERM);
+
+        Thread watcher = new Thread(() -> {
+            while (!stop.get()) {
+                int seen = termCountUnchecked(w1);
+                highest.accumulateAndGet(seen, Math::max);
+                lowest.accumulateAndGet(seen, Math::min);
+            }
+        }, "budget-watcher");
+        watcher.setDaemon(true);
+        watcher.start();
+
+        List<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < reservers; i++) {
+            Thread thread = new Thread(() -> {
+                for (int n = 0; n < iterations; n++) {
+                    try {
+                        reserveSlot(w1, 9000 + n);
+                    } catch (Exception refused) {
+                        // A full term refuses; that is an expected outcome here.
+                    }
+                }
+            }, "reserve-" + i);
+            threads.add(thread);
+            thread.start();
+        }
+        for (int i = 0; i < rotators; i++) {
+            Thread thread = new Thread(() -> {
+                for (int n = 0; n < iterations; n++) {
+                    try {
+                        rotateIfTermSpent(w1);
+                    } catch (Exception ignored) {
+                        // Reported through the budget, which is what is asserted.
+                    }
+                }
+            }, "rotate-" + i);
+            threads.add(thread);
+            thread.start();
+        }
+        for (Thread thread : threads) {
+            thread.join(AWAIT_TIMEOUT_MS);
+        }
+        stop.set(true);
+        watcher.join(AWAIT_TIMEOUT_MS);
+
+        int high = highest.get();
+        int low = lowest.get();
+        assertTrue(low >= 0,
+                "the term budget was observed at " + low + ", below zero. A refused reservation's late "
+                        + "decrement has to land after a rotation that already reset the counter, and from a "
+                        + "negative budget a term that already served its share keeps admitting jobs");
+        assertTrue(high <= Constants.JOBS_PER_TERM,
+                "the term budget was observed at " + high + ", above the cap of " + Constants.JOBS_PER_TERM
+                        + ". Publishing an over-cap value means the counter was moved before it was checked, "
+                        + "so concurrent readers see a spent term as having room left");
+    }
+
+    /** Reads the term budget without the checked reflection of termCount(). */
+    private static int termCountUnchecked(WorkerRemoteImpl worker) {
+        try {
+            return termCount(worker);
+        } catch (Exception unreadable) {
+            return 0;
+        }
+    }
+
+    @Test
     void aSpentTermStartsExactlyOneElectionHoweverManyThreadsNoticeIt() throws Exception {
         // maybeRotateCoordinator is private, and the race it guards is only
         // reachable from inside the node, so it is driven directly: put the term
@@ -387,9 +560,27 @@ class WorkerDispatchTest {
 
     /** Puts the node's term budget into the spent state a rotation reacts to. */
     private static void markTermSpent(WorkerRemoteImpl worker) throws Exception {
+        setTermCount(worker, Constants.JOBS_PER_TERM);
+    }
+
+    /** Writes the term budget directly, as a served job's reservation would. */
+    private static void setTermCount(WorkerRemoteImpl worker, int jobs) throws Exception {
         Field field = WorkerRemoteImpl.class.getDeclaredField("termJobsCoordinated");
         field.setAccessible(true);
-        ((AtomicInteger) field.get(worker)).set(Constants.JOBS_PER_TERM);
+        ((AtomicInteger) field.get(worker)).set(jobs);
+    }
+
+    private static int termCount(WorkerRemoteImpl worker) throws Exception {
+        Field field = WorkerRemoteImpl.class.getDeclaredField("termJobsCoordinated");
+        field.setAccessible(true);
+        return ((AtomicInteger) field.get(worker)).get();
+    }
+
+    /** Invokes the private reservation, which submits no work of its own. */
+    private static boolean reserveSlot(WorkerRemoteImpl worker, int jobId) throws Exception {
+        Method method = WorkerRemoteImpl.class.getDeclaredMethod("reserveTermSlot", int.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(worker, jobId);
     }
 
     /** Invokes the private rotation hook directly, as a finishing job would. */

@@ -93,7 +93,11 @@ public class WorkerNode {
                     if (peerCoordinator != -1) {
                         // Locally generated id: this node has seen no announcements
                         // yet, so it cannot collide with one the cluster already sent.
-                        self.receiveCoordinatorMessage(peerCoordinator, adoptMessageId(workerId));
+                        // Adopted without relaying - the peer already knows this
+                        // coordinator, and re-broadcasting it would reach the
+                        // coordinator under a fresh id, which it would read as a
+                        // new term and answer with a second full job budget.
+                        self.adoptCoordinator(peerCoordinator, adoptMessageId(workerId));
                         System.out.println("Adopted coordinator " + peerCoordinator
                                 + " from peer worker " + peerId + ".");
                     }
