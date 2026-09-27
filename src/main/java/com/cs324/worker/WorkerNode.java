@@ -1,6 +1,7 @@
 package com.cs324.worker;
 
 import com.cs324.common.BootstrapRemote;
+import com.cs324.common.Constants;
 import com.cs324.common.WorkerAddress;
 import com.cs324.common.WorkerRemote;
 
@@ -20,6 +21,11 @@ public class WorkerNode {
 
     /** Required by the assignment spec: worker nodes hold a "cs324" marker. */
     public static final String leaderman = "cs324";
+
+    // Low half of a locally generated coordinator-announcement id. A value no
+    // election counter reaches, so adopting a peer's leader can never be
+    // mistaken for a repeat of an election message.
+    private static final long ADOPT_MESSAGE_TAG = 0x5AD0L;
 
     public static void main(String[] args) {
         if (args.length < 4) {
@@ -42,7 +48,9 @@ public class WorkerNode {
         }
 
         // This demo runs on localhost; the address we advertise is what peers
-        // use to look us up again for the reverse neighbour edge.
+        // use to look us up again for the reverse neighbour edge. For a
+        // multi-host run only this line changes: pass the real hostname so
+        // remote workers register a reachable address.
         String myHost = "localhost";
 
         WorkerRemoteImpl self = null;
@@ -77,6 +85,21 @@ public class WorkerNode {
                 } catch (Exception e) {
                     System.out.println("Peer found but reverse connect failed: " + e.getMessage());
                 }
+                // Adopt the peer's coordinator if the cluster already has one,
+                // so a late joiner neither waits for an announcement it missed
+                // nor starts an election the cluster does not need.
+                try {
+                    int peerCoordinator = peerStub.getCurrentCoordinatorId();
+                    if (peerCoordinator != -1) {
+                        // Locally generated id: this node has seen no announcements
+                        // yet, so it cannot collide with one the cluster already sent.
+                        self.receiveCoordinatorMessage(peerCoordinator, adoptMessageId(workerId));
+                        System.out.println("Adopted coordinator " + peerCoordinator
+                                + " from peer worker " + peerId + ".");
+                    }
+                } catch (Exception e) {
+                    System.out.println("Could not read the peer's coordinator: " + e.getMessage());
+                }
             }
             // Start heartbeats: periodically ping the current coordinator via the
             // bootstrap's address records; a silent coordinator triggers a new election.
@@ -87,6 +110,31 @@ public class WorkerNode {
         }
 
         final WorkerRemoteImpl selfForHook = self;
+        final WorkerRemoteImpl selfForStartup = self;
+        if (selfForStartup != null) {
+            // The cluster elects itself: after a grace period, a worker that
+            // still knows no coordinator starts a wave. The delay lets the rest
+            // of the cluster register and adopt the first leader, so a normal
+            // startup produces one election rather than one per worker. A node
+            // that already adopted or received a coordinator stays quiet.
+            Thread startupElection = new Thread(() -> {
+                try {
+                    Thread.sleep(Constants.STARTUP_ELECTION_DELAY_MS);
+                    if (selfForStartup.getCurrentCoordinatorId() == -1) {
+                        System.out.println("No coordinator known after startup - starting an election.");
+                        selfForStartup.startElection();
+                    } else {
+                        System.out.println("Coordinator " + selfForStartup.getCurrentCoordinatorId()
+                                + " already known - no startup election needed.");
+                    }
+                } catch (Exception e) {
+                    System.out.println("Startup election skipped: " + e.getMessage());
+                }
+            }, "worker-startup-election-" + workerId);
+            // Daemon: must never hold the JVM open on its own.
+            startupElection.setDaemon(true);
+            startupElection.start();
+        }
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 // Stop the job thread pool first. If removed, pool threads leak and the JVM can hang on exit.
@@ -118,6 +166,15 @@ public class WorkerNode {
         // leave the JVM running forever. Explicit exit runs the shutdown hook,
         // which deregisters from the Bootstrap and unexports the remote object.
         System.exit(0);
+    }
+
+    /**
+     * Message id for a locally adopted coordinator announcement. Only this
+     * node's own id space matters: it is used to seed a joining worker's
+     * duplicate-suppression set, and elections use their own ids.
+     */
+    private static long adoptMessageId(int workerId) {
+        return ((long) workerId << 32) | ADOPT_MESSAGE_TAG;
     }
 
     private static void runMenu(WorkerRemoteImpl self, int workerId) {

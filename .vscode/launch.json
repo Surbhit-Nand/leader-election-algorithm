@@ -36,8 +36,17 @@
         {
             "type": "jdk",
             "request": "launch",
-            "name": "Client App",
+            "name": "Client App (callback port 1199)",
             "mainClass": "com.cs324.client.ClientApp",
+            "args": "localhost 1099 1199",
+            "console": "internalConsole"
+        },
+        {
+            "type": "jdk",
+            "request": "launch",
+            "name": "Client App 2 (callback port 1200)",
+            "mainClass": "com.cs324.client.ClientApp",
+            "args": "localhost 1099 1200",
             "console": "internalConsole"
         }
     ]

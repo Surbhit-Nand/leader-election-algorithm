@@ -12,19 +12,13 @@
 Clone the repo:
 
 ```
-git clone <your-repo-URL>
+git clone https://github.com/aryanjde/leader-election-algorithm.git
 ```
 
 Move into the project folder:
 
 ```
-cd A1_CS324
-```
-
-Switch to your branch (e.g. `suri`):
-
-```
-git checkout <name>
+cd leader-election-algorithm
 ```
 
 Build the project:
@@ -41,6 +35,8 @@ To run the Bootstrap Node, the Workers and the Client, see [How to Run](#how-to-
 
 The project has no runtime dependencies (JUnit is `test`-scoped), so the runtime classpath is just `target/classes`. These commands behave the same in VS Code, Apache NetBeans, IntelliJ, Eclipse and a plain terminal. Every node is a separate process, so start each one in its own terminal.
 
+**All nodes run on the same machine** (`localhost`), one terminal each.
+
 Bootstrap Node (start first, one only):
 
 ```
@@ -54,11 +50,16 @@ java -cp target/classes com.cs324.worker.WorkerNode 1 3500 localhost 1099
 java -cp target/classes com.cs324.worker.WorkerNode 2 3501 localhost 1099
 ```
 
-Client (Swing GUI - as many as you like):
+**The cluster elects a coordinator by itself** about 3 seconds after the workers start, so there is nothing to trigger by hand. A worker that already knows a coordinator stays quiet. To force a fresh election at any time, press `[1]` in a worker's terminal.
+
+Client (Swing GUI). Every client process needs **its own callback port** for receiving results, so start one client per terminal and give each a different port — `1199`, `1200`, `1201`, ... Launching the same port twice on one machine makes the second client fail to bind:
 
 ```
-java -cp target/classes com.cs324.client.ClientApp
+java -cp target/classes com.cs324.client.ClientApp localhost 1099 1199
+java -cp target/classes com.cs324.client.ClientApp localhost 1099 1200
 ```
+
+The arguments are `bootstrapHost bootstrapPort clientRmiPort`; all three are optional and default to `localhost 1099 1199`.
 
 ### VS Code
 
@@ -70,9 +71,10 @@ Press **F5** (Run and Debug) and pick a configuration from `.vscode/launch.json`
 | `Worker 1 (id 1, port 3500)` | `com.cs324.worker.WorkerNode` | `1 3500 localhost 1099` |
 | `Worker 2 (id 2, port 3501)` | `com.cs324.worker.WorkerNode` | `2 3501 localhost 1099` |
 | `Worker 3 (id 3, port 3502)` | `com.cs324.worker.WorkerNode` | `3 3502 localhost 1099` |
-| `Client App` | `com.cs324.client.ClientApp` | - |
+| `Client App (callback port 1199)` | `com.cs324.client.ClientApp` | `localhost 1099 1199` |
+| `Client App 2 (callback port 1200)` | `com.cs324.client.ClientApp` | `localhost 1099 1200` |
 
-Every configuration names an explicit main class, so the IDE never has to guess it.
+Every configuration names an explicit main class, so the IDE never has to guess it. The two client configurations use different callback ports, which is what lets you run two clients at once.
 
 ### Apache NetBeans
 
@@ -96,54 +98,24 @@ For anything that has to keep running, fork a JVM with `exec:exec` (`%classpath`
 mvn exec:exec -Dexec.executable=java -Dexec.args="-classpath %classpath com.cs324.bootstrap.BootstrapNode 1099"
 ```
 
-**Why fork:** `exec:java` runs the program inside the Maven JVM and only tracks threads created in its own thread group. RMI (`LocateRegistry.createRegistry`, exported remote objects) creates non-daemon threads in the *system* thread group, so a node started that way can disappear as soon as the build finishes - measured on this repo: `mvn -Pbootstrap exec:java` printed `Bootstrap Node running on port 1099 as BootstrapRegistry` and then exited, while the `exec:exec` form was still listening on port 1099 after 30 seconds and released the port when Maven was stopped.
+**Why fork:** `exec:java` runs the program inside the Maven JVM and only tracks threads created in its own thread group. RMI (`LocateRegistry.createRegistry`, exported remote objects) creates non-daemon threads in the *system* thread group, so a node started that way can disappear as soon as the build finishes - measured on this repo: `mvn -Pbootstrap exec:java` printed `Bootstrap Node running on port 1099 as BootstrapRegistry` and then exited, while the `exec:exec` form was still listening on port 1099 after 30 seconds and released the port when Maven was stopped. The same applies to the client, which creates its own result registry, so the `java -cp target/classes` commands above are the ones to use for the demo.
 
 ### Troubleshooting
 
 - `Error: Could not find or load main class ${packageClassName}` - the IDE ran NetBeans' default Maven "run" action without substituting `${packageClassName}` (this is what the Oracle Java extension for VS Code did). That placeholder is filled in by the IDE, never by Maven, so it must not reach the command line. Use one of the recipes above instead.
 - `release version 25 not supported` - the IDE or Maven is running on a JDK older than 25. Point it at JDK 25+.
+- A second client exits immediately, or the first one stops receiving results - the two are sharing a callback port. Give each client its own port (see [How to Run](#how-to-run-any-ide-or-terminal)).
+- `Address already in use` on a worker - that RMI port is still held by an earlier run. Pick a different one, or close the old terminal.
 
 ---
 
-## Every Time You Work On This (AFTER IMPLEMENTING WORKERS)
-
-Pull the latest changes first:
+## Running the Tests
 
 ```
-git pull origin <name>
+mvn test
 ```
 
-Rebuild after changing code:
-
-```
-mvn -q compile
-```
-
-Start the Bootstrap Node first (one only), then one Worker per terminal (unique id + port each time) and as many Clients as you like - the full list is in [How to Run](#how-to-run-any-ide-or-terminal):
-
-```
-java -cp target/classes com.cs324.bootstrap.BootstrapNode 1099
-java -cp target/classes com.cs324.worker.WorkerNode 1 3500 localhost 1099
-java -cp target/classes com.cs324.client.ClientApp
-```
-
-When you're done, stage your changes:
-
-```
-git add -A
-```
-
-Commit them:
-
-```
-git commit -m "your message here"
-```
-
-Push them:
-
-```
-git push origin <name>
-```
+75 JUnit 5 tests cover the election protocol, duplicate-message handling, job splitting and aggregation, client callbacks, coordinator rotation and thread safety.
 
 ---
 
@@ -151,7 +123,9 @@ git push origin <name>
 
 These are settled interpretations of ambiguous spec points. Keep implementations consistent with these across all worker/election/job-dispatch code.
 
-- **JAC increments per worker assignment, not per client job.** Per the spec: _"The counter is incremented each time that worker, while acting as coordinator, assigns a job to another worker."_ Taken literally, if a single client job is split across 3 other workers, the coordinator's JAC increases by 3 in that one request — not by 1. A term (5 increments) can therefore end well before 5 separate client jobs have been processed, depending on how many workers are active.
+- **JAC increments per worker assignment, not per client job.** Per the spec: _"The counter is incremented each time that worker, while acting as coordinator, assigns a job to another worker."_ Taken literally, if a single client job is split across 3 other workers, the coordinator's JAC increases by 3 in that one request — not by 1. The JAC's only role is therefore to rank candidates during an election (lowest wins, highest ID breaks ties).
+- **A term lasts 5 client jobs, counted per job rather than per assignment.** The job budget is tracked separately from the JAC, so a term's length does not depend on how many workers happen to be active: the coordinator accepts five client jobs, then starts a new election and yields. Counting assignments instead would have ended a term after two jobs on a four-worker cluster, which does not match the "five jobs per term" rule. The counter resets whenever a node becomes the coordinator, so each term gets a full budget.
+- **The cluster elects a coordinator on its own.** Workers wait a short grace period after registering and start an election only if they still know no coordinator, and a joining worker adopts the leader its peer already knows. No manual step is needed before the first job, and a normal startup converges to a single coordinator.
 - **The coordinator participates in every job's computation.** It does not only delegate — it takes its own share of the workload (its own sub-range/sub-list) alongside the workers it assigns tasks to.
 - **Coordinator failure detection uses heartbeats.** Workers periodically ping the current coordinator; a missed response is what triggers a new election. This is separate from the election-termination mechanism (echo-based, see election design notes).
 - **Fault tolerance is out of scope for this assignment.** No requirement to handle a worker or coordinator dying mid-job or mid-election — that's Assignment 2's focus.
@@ -224,10 +198,10 @@ Run its tests:
 mvn "-Dtest=WorkerTaskCalculatorTest" test
 ```
 
-Run the updated client:
+Run the updated client (use the forked form - see [Why fork](#command-line-with-maven-optional)):
 
 ```powershell
-mvn compile exec:java "-Dexec.mainClass=com.cs324.client.ClientApp"
+java -cp target/classes com.cs324.client.ClientApp localhost 1099 1199
 ```
 
 ### Distribution integration
@@ -238,13 +212,8 @@ provides worker addresses; it does not calculate, split or combine jobs. Manual 
 clients must also request their job IDs from bootstrap. IDs last for one bootstrap
 process; restart the whole cluster together when starting a fresh run.
 
-Each client process needs its own callback registry port. For two clients on the
-same machine, launch these in separate terminals after bootstrap and workers:
-
-```powershell
-java -cp target/classes com.cs324.client.ClientApp localhost 1099 1199
-java -cp target/classes com.cs324.client.ClientApp localhost 1099 1200
-```
+Each client process needs its own callback registry port; see the two-client
+commands in [How to Run](#how-to-run-any-ide-or-terminal).
 
 With four registered workers, PRIMESUM(1,1000) splits into 1-250, 251-500,
 501-750 and 751-1000 and combines to **76127**. The coordinator takes the first
@@ -253,4 +222,6 @@ chunk. Smaller lists/ranges may use fewer workers to avoid empty chunks.
 `ClusterDistributionTest` uses four workers connected in a chain over RMI. It
 checks every worker's participation, the assignment's range example, waiting for
 a delayed worker, result delivery after a leader change, and two concurrent client
-callbacks with distinct job IDs. Existing election and threading tests remain intact.
+callbacks with distinct job IDs. `WorkerDispatchTest` covers the five-job term:
+the coordinator keeps leading through four jobs and rotates to the lowest-JAC
+worker on the fifth. Existing election and threading tests remain intact.

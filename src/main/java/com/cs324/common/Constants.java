@@ -19,4 +19,9 @@ public class Constants {
 
     // How often workers probe their current coordinator (heartbeat)
     public static final int HEARTBEAT_INTERVAL_MS = 2000;
+
+    // Grace period after startup before a worker starts an election if it has
+    // not heard of a coordinator. Long enough for the rest of the cluster to
+    // register and adopt a leader, so only a genuinely leaderless cluster votes.
+    public static final int STARTUP_ELECTION_DELAY_MS = 3000;
 }
