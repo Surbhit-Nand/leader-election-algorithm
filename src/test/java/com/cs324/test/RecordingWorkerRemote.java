@@ -7,19 +7,13 @@ import java.rmi.server.UnicastRemoteObject;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/**
- * Test double that records every remote call it receives.
- *
- * Unlike FakeWorkerRemote (a silent no-op), this one keeps an audit trail, which
- * is what makes questions like "did the neighbour really receive that message
- * over RMI?" assertable instead of assumed.
- *
- * Every interface method is implemented, even the ones a given test does not
- * use, so this can be bound in a real RMI registry and looked up by name.
- */
+// Test double that records every remote call it receives.
+// Unlike FakeWorkerRemote it keeps an audit trail, which is what makes delivery assertable.
+// Every method is implemented, not just the ones a test uses, so it can be bound by name.
 public class RecordingWorkerRemote extends UnicastRemoteObject implements WorkerRemote {
 
     private final int id;
+    // One append-only log for every call kind, which the helpers below match by prefix.
     private final List<String> calls = new CopyOnWriteArrayList<>();
 
     public RecordingWorkerRemote(int id) throws RemoteException {
@@ -27,8 +21,8 @@ public class RecordingWorkerRemote extends UnicastRemoteObject implements Worker
         this.id = id;
     }
 
-    // --- observation helpers used by tests ---
 
+    // A copy, so a test can iterate while RMI threads keep appending.
     public List<String> calls() {
         return List.copyOf(calls);
     }
@@ -53,7 +47,7 @@ public class RecordingWorkerRemote extends UnicastRemoteObject implements Worker
         return calls.stream().anyMatch(call -> call.startsWith("result|" + jobId + "|" + workerId + "|"));
     }
 
-    /** The value most recently reported for a job by a given worker, or null. */
+    // The newest value wins, because the log is append-only and in arrival order.
     public String lastReportedResult(int jobId, int workerId) {
         String prefix = "result|" + jobId + "|" + workerId + "|";
         String last = null;
@@ -65,7 +59,6 @@ public class RecordingWorkerRemote extends UnicastRemoteObject implements Worker
         return last;
     }
 
-    // --- WorkerRemote contract ---
 
     @Override
     public int getId() throws RemoteException {
@@ -74,6 +67,7 @@ public class RecordingWorkerRemote extends UnicastRemoteObject implements Worker
 
     @Override
     public int getJobAllocationCounter() throws RemoteException {
+        // Zero keeps the default election outcome (higher id wins) for tests that do not set it.
         return 0;
     }
 
@@ -84,6 +78,7 @@ public class RecordingWorkerRemote extends UnicastRemoteObject implements Worker
 
     @Override
     public long startElection() throws RemoteException {
+        // A fixed return id, so tests match on the recorded call rather than the value.
         calls.add("startElection");
         return 0L;
     }
@@ -105,6 +100,7 @@ public class RecordingWorkerRemote extends UnicastRemoteObject implements Worker
 
     @Override
     public void receiveElectionMessage(int originId, int candidateId, int candidateJac, long messageId) throws RemoteException {
+        // Only origin and wave id are recorded, which is all the assertions match on.
         calls.add("election|" + originId + "|" + messageId);
     }
 
@@ -129,6 +125,7 @@ public class RecordingWorkerRemote extends UnicastRemoteObject implements Worker
     }
 
     @Override
+        // The result is stored as text, which is how lastReportedResult reads it back.
     public void reportTaskResult(int jobId, int workerId, Object result) throws RemoteException {
         calls.add("result|" + jobId + "|" + workerId + "|" + result);
     }

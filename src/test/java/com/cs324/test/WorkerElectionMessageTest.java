@@ -20,26 +20,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * Step 3 of the worker test plan: receiveElectionMessage().
- *
- * Two rules matter here, and they pull in opposite directions:
- *
- *   1. An ELECTION must reach every neighbour EXCEPT the one it arrived from,
- *      so it spreads outward instead of bouncing back to the parent.
- *   2. A message id that has already been processed must not be re-forwarded -
- *      otherwise a cycle in the unstructured network loops forever.
- *
- * ...but rule 2 cannot mean "silently drop it". The node that forwarded to us is
- * waiting for our reply, so a duplicate still has to be ANSWERED, or two nodes
- * that forwarded to each other simply wait forever. These tests pin down both
- * halves.
- *
- * That duplicate does not have to arrive from the same neighbour that sent the
- * first copy - a cycle in the network hands it back by a different path, which
- * is also the one case where rule 1 on its own would forward the election to the
- * node that has already sent it. The answer has to go to whoever sent this copy.
- */
+// One hop of receiveElectionMessage, over real RMI with recording doubles on both sides.
+// Two rules pull against each other: an ELECTION must reach every neighbour except the one it
+// arrived from, and an already-processed id must not be re-forwarded or a cycle loops forever.
+// But the second rule cannot mean dropping it. Whoever forwarded to us is waiting for a reply,
+// so a duplicate must still be answered - and it can arrive from a different neighbour than the
+// first copy, which is exactly the case where rule 1 alone would forward the election back.
 class WorkerElectionMessageTest {
 
     private static final int TEST_RMI_PORT = 19802;
@@ -48,6 +34,7 @@ class WorkerElectionMessageTest {
 
     private static Registry registry;
 
+    // worker is real; the two neighbours are recording doubles, so arrival is assertable.
     private WorkerRemoteImpl worker;      // id 1 - the node under test
     private RecordingWorkerRemote sender; // id 2 - the neighbour the ELECTION arrives from
     private RecordingWorkerRemote other;  // id 3 - the neighbour it must be forwarded to
@@ -64,6 +51,7 @@ class WorkerElectionMessageTest {
 
     @BeforeEach
     void setUp() throws Exception {
+        // Two neighbours only, and the node under test is never its own neighbour.
         worker = new WorkerRemoteImpl(1);
         sender = new RecordingWorkerRemote(2);
         other = new RecordingWorkerRemote(3);
@@ -77,6 +65,7 @@ class WorkerElectionMessageTest {
 
     @AfterEach
     void tearDown() throws Exception {
+        // Every binding must go, or the next test resolves a double left over from this one.
         for (String name : registry.list()) {
             registry.unbind(name);
         }
@@ -92,21 +81,24 @@ class WorkerElectionMessageTest {
         try {
             UnicastRemoteObject.unexportObject(remoteObject, true);
         } catch (NoSuchObjectException ignored) {
-            // already unexported, nothing to do
+            // Already unexported by the test itself, so a second attempt is not an error.
         }
     }
 
+    // Prefix-matched, so a call kind can be counted without parsing the rest of the entry.
     private static long countOf(List<String> calls, String prefix) {
         return calls.stream().filter(call -> call.startsWith(prefix)).count();
     }
 
     @Test
     void anElectionIsForwardedToEveryNeighbourExceptTheSender() throws Exception {
+        // Arrived from worker 2, so the wave may only leave through worker 3.
         worker.receiveElectionMessage(2, 2, 0, ELECTION_ID);
 
         assertTrue(other.receivedElection(1, ELECTION_ID),
                 "the election must be passed on to the other neighbours; recorded: " + other.calls());
 
+        // Back to worker 2 would bounce it off its own parent; worker 3 must get it.
         assertFalse(sender.receivedElection(1, ELECTION_ID),
                 "the election must not be sent back to the neighbour it came from; recorded: " + sender.calls());
     }
@@ -119,6 +111,7 @@ class WorkerElectionMessageTest {
         assertEquals(1L, countOf(other.calls(), "election|"),
                 "a duplicate must not be forwarded a second time; recorded: " + other.calls());
 
+        // Answering is not optional - the parent is blocked until this echo arrives.
         assertEquals(1L, countOf(sender.calls(), "echo|"),
                 "a duplicate must still be answered with exactly one echo - dropping it silently leaves the "
                         + "forwarding node waiting forever, which deadlocks any network containing a cycle; "
@@ -134,11 +127,9 @@ class WorkerElectionMessageTest {
                 "the first copy must be passed on to the neighbours other than the one it came from; recorded: "
                         + other.calls());
 
-        // Same election id, but arriving from the OTHER neighbour. In a network
-        // with a cycle this is the election coming back round by a different
-        // path, and it is the case rule 1 alone would get wrong: "forward to
-        // every neighbour except the sender" now means forwarding to worker 2,
-        // the node that has already sent us this exact election.
+        // Same election id, but arriving from the OTHER neighbour: in a network with a cycle
+        // this is the election coming back by a different path, and the one case where rule 1
+        // alone is wrong - it would now mean forwarding to worker 2, which already sent it.
         worker.receiveElectionMessage(3, 3, 0, ELECTION_ID);
 
         assertEquals(1L, countOf(other.calls(), "election|"),
@@ -176,13 +167,12 @@ class WorkerElectionMessageTest {
 
     @Test
     void copiesArrivingAtTheSameInstantAreForwardedOnceAndAnsweredOnce() throws Exception {
-        // Two copies of one wave, released together, so one of them lands while the
-        // other is still being processed. Claiming the id before publishing the
-        // wave used to leave that second copy with no state to answer from, and the
-        // node that sent it waited for an echo that never came. The window is only
-        // microseconds wide, so this hammers it rather than trying to place a
-        // single delivery inside it on purpose.
+        // Two copies of one wave released together, so the second lands while the first is still
+        // being processed. Claiming the id before publishing the wave used to leave that copy
+        // with no state to answer from, and its sender waited for an echo that never came. The
+        // window is microseconds wide, so hammer it rather than place a delivery inside it.
         final int attempts = 300;
+        // A fresh id per attempt, so one round cannot mask another's duplicates.
         for (int attempt = 0; attempt < attempts; attempt++) {
             final long messageId = 900L + attempt;
             CountDownLatch fire = new CountDownLatch(1);
@@ -195,9 +185,8 @@ class WorkerElectionMessageTest {
             fromSender.join(5_000);
             fromOther.join(5_000);
 
-            // Which copy is processed first is not deterministic, so the invariant
-            // is counted across both neighbours rather than per neighbour: the wave
-            // goes out once, and the copy that lost the race is answered once.
+            // Which copy is processed first is not deterministic, so the invariant is counted
+            // across both neighbours: the wave goes out once, and the loser is still answered.
             assertEquals(1L, deliveriesFor("election|", messageId),
                     "attempt " + attempt + ": the wave must be forwarded exactly once however many copies "
                             + "arrived; recorded: " + sender.calls() + " / " + other.calls());
@@ -208,7 +197,7 @@ class WorkerElectionMessageTest {
         }
     }
 
-    /** Delivers one copy of an election, waiting on the gate so copies race. */
+    // Delivers one copy of an election, waiting on the gate so copies really do race.
     private void deliverElection(CountDownLatch fire, int fromWorkerId, long messageId) {
         try {
             fire.await();
@@ -220,7 +209,8 @@ class WorkerElectionMessageTest {
         }
     }
 
-    /** How many times the given prefix was recorded for one message, across both neighbours. */
+    // Counts one message kind for a single id across both neighbours, since either may be the
+    // parent that forwarded and either may be the child still waiting on an answer.
     private long deliveriesFor(String prefix, long messageId) {
         String suffix = "|" + messageId;
         long count = 0;

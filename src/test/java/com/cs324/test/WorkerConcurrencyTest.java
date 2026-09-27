@@ -25,33 +25,28 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-/**
- * Group 6: concurrency / thread-safety tests for worker-side job execution.
- *
- * Covers the acceptance checklist without touching election semantics:
- *  - multiple jobs run concurrently and all complete (no head-of-line blocking)
- *  - duplicate assignTask(jobId) collapses to a single execution (no double work)
- *  - concurrent reportTaskResult() calls for the SAME jobId from DIFFERENT
- *    workers are all retained (no lost updates)
- *  - concurrent startElection() calls still produce unique message IDs
- *
- * JAC note: per the spec and the Design Decisions note, JAC counts assignments
- * issued by a coordinator to other workers, so a worker RECEIVING assignTask()
- * does not increment its own counter (that happens on the coordinator in
- * submitJob()). These tests therefore assert the receiver's JAC stays 0 while
- * still verifying exactly-once execution and concurrency safety.
- */
+// Concurrency / thread-safety tests for worker-side job execution, kept clear of
+// election semantics: distinct jobs must not block each other, duplicate
+// assignments must collapse to one execution, and per-worker results for a
+// single job must all survive a concurrent update.
+// JAC note: the spec counts assignments a coordinator issues to others, so a
+// worker RECEIVING assignTask() leaves its own counter at zero - that is moved
+// in submitJob() on the coordinator side.
 class WorkerConcurrencyTest {
 
+    // Ports are unique per class, so the suites can run side by side.
     private static final int TEST_RMI_PORT = 19807;
     private static final String HOST = "localhost";
     private static final int COORDINATOR_ID = 9;
     private static final int THIS_WORKER_ID = 1;
     private static final long AWAIT_TIMEOUT_MS = 10_000;
 
+    // Shared by every test here, created once so none pays registry startup.
     private static Registry registry;
 
+    // The worker under test: id 1, with one recorder acting as its coordinator.
     private WorkerRemoteImpl worker;
+    // Stands in for the coordinator, recording every result reported to it.
     private RecordingWorkerRemote coordinator;
 
     @BeforeAll
@@ -72,6 +67,7 @@ class WorkerConcurrencyTest {
         registry.rebind("Worker" + COORDINATOR_ID, coordinator);
 
         worker.connectAsNeighbour(COORDINATOR_ID, HOST, TEST_RMI_PORT);
+        // Without a known coordinator, results would fall back to reporting to self.
         worker.receiveCoordinatorMessage(COORDINATOR_ID, 777L);
     }
 
@@ -90,6 +86,7 @@ class WorkerConcurrencyTest {
         unexportQuietly(coordinator);
     }
 
+    // RMI export is a side effect of construction, so every test unexports its doubles.
     private void unexportQuietly(Remote remoteObject) {
         if (remoteObject == null) {
             return;
@@ -100,6 +97,7 @@ class WorkerConcurrencyTest {
         }
     }
 
+    // Polls because the compute runs on a pool thread; a fixed sleep would be flaky.
     private void awaitReportedResult(int jobId) throws Exception {
         long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
         while (System.currentTimeMillis() < deadline) {
@@ -113,12 +111,14 @@ class WorkerConcurrencyTest {
     }
 
     @Test
+    // Head-of-line blocking: 20 distinct jobs all finish, none queued behind another.
     void concurrentDistinctJobsAllCompleteWithoutBlockingEachOther() throws Exception {
         int jobs = 20;
         ExecutorService submitters = Executors.newFixedThreadPool(8);
         try {
             for (int j = 0; j < jobs; j++) {
                 final int jobId = 1000 + j;
+                // assignTask must return at once; the slice is computed on the worker pool.
                 submitters.submit(() -> {
                     try {
                         worker.assignTask(jobId, "MAX", new int[]{jobId, jobId + 1, jobId - 1});
@@ -133,8 +133,7 @@ class WorkerConcurrencyTest {
             submitters.shutdownNow();
         }
 
-        // assignTask must be fire-and-return: all 20 submissions above complete fast,
-        // then every background computation reports back independently.
+        // Fire-and-return: all 20 submissions complete first, then each result reports back.
         for (int j = 0; j < jobs; j++) {
             awaitReportedResult(1000 + j);
         }
@@ -143,17 +142,18 @@ class WorkerConcurrencyTest {
                     coordinator.lastReportedResult(1000 + j, THIS_WORKER_ID),
                     "wrong MAX result for job " + (1000 + j));
         }
-        // Assigning work is fire-and-return; the receiver never counts it.
-        // JAC is a coordinator-only counter (see submitJob()).
+        // JAC is a coordinator-only counter, so a receiver's own counter stays at zero.
         assertEquals(0, worker.getJobAllocationCounter(),
                 "a worker that receives assignTask() must not increment its own JAC; "
                         + "JAC counts coordinator-side assignments only");
     }
 
     @Test
+    // Regression: one jobId assigned concurrently must be computed and reported once.
     void duplicateConcurrentSubmissionsOfTheSameJobExecuteOnlyOnce() throws Exception {
         int duplicates = 10;
         int jobId = 2000;
+        // One latch for all submitters, so the claim race is as wide as possible.
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService submitters = Executors.newFixedThreadPool(duplicates);
         try {
@@ -174,8 +174,8 @@ class WorkerConcurrencyTest {
             submitters.shutdownNow();
         }
 
+        // Exactly one report is due; waiting past it would expose a stray duplicate.
         awaitReportedResult(jobId);
-        // Give any stray duplicate execution a chance to (incorrectly) report again.
         Thread.sleep(300);
 
         long reports = coordinator.calls().stream()
@@ -190,9 +190,11 @@ class WorkerConcurrencyTest {
     }
 
     @Test
+    // The per-job lock must let 8 workers report one job concurrently without loss.
     void concurrentResultsForTheSameJobFromDifferentWorkersAreAllRetained() throws Exception {
         int jobId = 3000;
         int reporters = 8;
+        // Same latch: every reporter races into the same job at the same moment.
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService pool = Executors.newFixedThreadPool(reporters);
         try {
@@ -214,6 +216,7 @@ class WorkerConcurrencyTest {
             pool.shutdownNow();
         }
 
+        // The (jobId, workerId) composite key is what stops results overwriting each other.
         Map<Integer, Object> results = worker.getJobResults(jobId);
         assertEquals(reporters, results.size(),
                 "concurrent per-worker results for one job must not overwrite each other: " + results);
@@ -223,11 +226,14 @@ class WorkerConcurrencyTest {
     }
 
     @Test
+    // Election ids come from an AtomicLong, so a race cannot hand two waves the same id.
     void concurrentElectionsProduceUniqueMessageIds() throws Exception {
         int elections = 10;
         ExecutorService pool = Executors.newFixedThreadPool(elections);
+        // Collection is shared across pool threads, so it needs its own synchronisation.
         Set<Long> ids = java.util.Collections.synchronizedSet(new HashSet<>());
         try {
+        // All 10 threads block on one latch, so the wave starts are as simultaneous as possible.
             CountDownLatch start = new CountDownLatch(1);
             for (int i = 0; i < elections; i++) {
                 pool.submit(() -> {

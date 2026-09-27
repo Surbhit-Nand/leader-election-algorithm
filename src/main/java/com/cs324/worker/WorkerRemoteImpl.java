@@ -27,19 +27,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * WorkerRemoteImpl implementing distributed leader election, echo algorithm, and concurrent task execution.
- */
 public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemote {
 
-    /** Required by the assignment spec: worker nodes hold a "cs324" marker. */
+        // Declared per the assignment; not read anywhere in the implementation.
     public static final String leaderman = "cs324";
 
+    // One election wave, plus the bookkeeping needed to complete it.
     private static class ElectionState {
+        // Neighbour that forwarded this wave, so results can be echoed back to it.
         int parentId;
+        // Best candidate in this wave so far, compared by JAC then by id.
         int bestCandidateId;
         int bestCandidateJac;
+        // Neighbours that have not answered yet; the wave completes when this empties.
         final Set<Integer> pendingChildren = ConcurrentHashMap.newKeySet();
+        // Latch so a wave echoes upward exactly once, however many triggers fire.
         boolean echoed = false;
 
         ElectionState(int parentId, int bestCandidateId, int bestCandidateJac) {
@@ -49,96 +51,70 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
     }
 
+    // This worker's id, and the tie-break when two workers share a JAC.
     private final int id;
-    // Holds the Job Allocation Counter. AtomicInteger = thread-safe counter.
+    // JAC: work shed to other workers, excluding our own share. Decides elections.
     private final AtomicInteger jobAllocationCounter = new AtomicInteger(0);
-    // Group 6: lock-free unique election IDs. Previously a plain long guarded by
-    // synchronized startElection(); AtomicLong keeps IDs unique under concurrent
-    // startElection() calls without serialising callers. Field name/type of
-    // jobAllocationCounter is pinned by tests via reflection - do not rename it.
-    // AtomicLong = thread-safe counter.
+    // Unique per worker, so election message ids need no coordination.
     private final AtomicLong electionCounter = new AtomicLong(0);
-    // The currently known coordinator. volatile = every thread always sees the newest value.
-    private volatile int currentCoordinatorId = -1; // -1 = no known coordinator yet
-    // IDs of election messages already seen. Concurrent set = thread-safe.
+    // -1 when unknown; volatile so every thread sees the newest coordinator.
+    private volatile int currentCoordinatorId = -1;
+    // Audit record of election message ids. Deliberately not the dedup guard.
     private final Set<Long> seenMessageIds = ConcurrentHashMap.newKeySet();
-    // IDs of coordinator messages already seen.
+    // Coordinator announcement ids, so a broadcast looping back is applied once.
     private final Set<Long> seenCoordinatorMessageIds = ConcurrentHashMap.newKeySet();
-    // Ongoing elections by message ID. ConcurrentHashMap = safe for RMI threads.
+    // Election waves still in flight, by message id.
     private final Map<Long, ElectionState> elections = new ConcurrentHashMap<>();
-    // Known neighbours by worker ID. ConcurrentHashMap = safe to read while another thread adds a neighbour.
+    // Peer stubs, read while another thread may be adding a neighbour.
     private final Map<Integer, WorkerRemote> neighbours = new ConcurrentHashMap<>();
 
-    /** Composite key so concurrent results for the SAME jobId from DIFFERENT workers never clobber each other. */
-    // Record = tiny container for (jobId, workerId).
+    // Composite key, so two workers' results for one job cannot overwrite each other.
     private record JobResultKey(int jobId, int workerId) implements java.io.Serializable {}
 
-    // Concurrency & Task tracking (Group 6)
-    // Bounded pool with named daemon threads: concurrent jobs run in parallel,
-    // a slow/long job never blocks unrelated jobs, and the pool can be shut down
-    // cleanly via shutdown(). Daemon threads so a forgotten shutdown never hangs the JVM.
-    // FixedThreadPool = limited workers running jobs in parallel.
+    // Pool for job slices; daemon threads, so a missed shutdown cannot hang the JVM.
     private final ExecutorService executor = Executors.newFixedThreadPool(
-            // Pool size = CPUs x 2 (min 4). Enough parallelism without overload.
             Math.max(4, Runtime.getRuntime().availableProcessors() * 2),
-            // ThreadFactory = names each thread.
             new ThreadFactory() {
-                // Counter for thread names. AtomicInteger = safe numbering.
                 private final AtomicInteger seq = new AtomicInteger(0);
                 @Override
                 public Thread newThread(Runnable r) {
-                    // Build one pool thread.
                     Thread t = new Thread(r, "worker-task-" + seq.incrementAndGet());
-                    // Daemon = JVM can exit even if threads are alive.
                     t.setDaemon(true);
                     return t;
                 }
             });
-    // Per (jobId, workerId) results. ConcurrentHashMap gives lock-free thread-safe put/read.
+    // Partial results, keyed by job and worker until the job is aggregated.
     private final Map<JobResultKey, Object> taskResults = new ConcurrentHashMap<>();
-    // Exactly-once guard: jobIds already accepted (in-flight or done). add() is atomic,
-    // so concurrent duplicate assignTask(jobId) calls collapse to a single execution.
-    // Job IDs are assumed unique per job; a repeated jobId is treated as a retry and suppressed.
+    // Exactly-once guard, claimed before submit so duplicate assignTask calls collapse.
     private final Set<Integer> seenJobIds = ConcurrentHashMap.newKeySet();
-    // In-flight tasks for lifecycle observability (not used for locking).
+    // Observability only - never a lock, so nothing waits on it.
     private final Set<Integer> activeTasks = ConcurrentHashMap.newKeySet();
 
-    // ---- Coordinator job dispatch (client jobs) ----
-    // A submitted job is split across the coordinator and its neighbours; the
-    // coordinator tracks which workers it is still waiting on and aggregates
-    // results once all have reported back.
+    // One in-flight client job: who owes us a result, and where to deliver it.
     private record JobState(String jobType, Set<Integer> expected, String clientHost, int clientPort, String clientName, AtomicBoolean dispatchComplete) {}
 
+    // Stops the same job id being coordinated twice.
     private final Set<Integer> submittedJobIds = ConcurrentHashMap.newKeySet();
 
+    // Jobs this worker is coordinating right now.
     private final Map<Integer, JobState> coordinatingJobs = new ConcurrentHashMap<>();
 
-    // ---- Heartbeat / coordinator-failure detection ----
-    // Daemon scheduler so a forgotten shutdown never hangs the JVM.
+    // Single daemon scheduler for coordinator liveness probes.
     private final ScheduledExecutorService heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "worker-heartbeat");
         t.setDaemon(true);
         return t;
     });
-    // Set by WorkerNode once the worker has registered with the bootstrap.
+    // Bootstrap directory, set once on join; null in tests so we fall back to peers.
     private volatile BootstrapRemote bootstrap;
-    // Cached coordinator stub (reused across beats; reset when it fails).
+    // Cached coordinator stub, valid only while cachedCoordinatorId still matches.
     private volatile WorkerRemote coordinatorStub;
     private volatile int cachedCoordinatorId = -1;
-    // Skip a beat if the previous one is still blocked on a slow coordinator,
-    // so a slow peer cannot stack up probes.
+    // Keeps a single probe in flight so heartbeat ticks never overlap.
     private final AtomicBoolean heartbeatInFlight = new AtomicBoolean(false);
-    // Number of client jobs this worker has coordinated in its current term.
-    // A term lasts Constants.JOBS_PER_TERM client jobs, counted per job rather
-    // than per assignment, so a term's length does not depend on how many
-    // workers the cluster has. Reset whenever this node becomes the coordinator.
+    // Client jobs served this term, reserved by CAS and never above JOBS_PER_TERM.
     private final AtomicInteger termJobsCoordinated = new AtomicInteger(0);
-    // Set while this node is yielding leadership after a spent term. The job
-    // budget is already reset to 0 at that point, but currentCoordinatorId
-    // still names this node until the election concludes - so without this flag
-    // a job arriving in that window would pass the coordinator check and start
-    // a fresh budget inside a term the spec has already spent. Cleared when a
-    // coordinator announcement arrives or when this node learns the wave outcome.
+    // Closed between winning a rotation and the next coordinator announcement.
     private final AtomicBoolean handoverInProgress = new AtomicBoolean(false);
 
     public WorkerRemoteImpl(int id) throws RemoteException {
@@ -161,12 +137,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         return currentCoordinatorId;
     }
 
-    /** Local helper for the WorkerNode console menu (not part of the RMI contract). */
     public Set<Integer> getNeighbourIds() {
         return Set.copyOf(neighbours.keySet());
     }
 
-    /** Client jobs coordinated in the current term; a term ends at JOBS_PER_TERM. */
+    // Lets a client see how much of the term budget is left.
     public int getJobsCoordinatedInTerm() {
         return termJobsCoordinated.get();
     }
@@ -176,47 +151,31 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         return true;
     }
 
-    /**
-     * Initiates a new election wave from this node using a bitwise-packed unique message ID.
-     * Group 6: lock-free (no method-level synchronized). The ID is unique via AtomicLong;
-     * per-election setup is thread-confined until published into the concurrent map,
-     * and neighbour fan-out uses a snapshot so concurrent connectAsNeighbour() calls
-     * cannot interfere with this wave.
-     */
+    // Starts a new wave: we are the origin and begin as our own best candidate.
     public long startElection() {
-        // Build a unique message ID from worker ID + counter. AtomicLong = no two elections share an ID.
+        // Worker id in the high bits keeps message ids globally unique without a registry.
         long messageId = ((long) id << 32) | (electionCounter.getAndIncrement());
-        // Remember this ID so repeats are recognised as duplicates.
         seenMessageIds.add(messageId);
 
-        // Read our JAC for the candidate comparison. Atomic get = always the newest value.
         int currentJac = jobAllocationCounter.get();
-        // Create this wave's tracking object (starts with us as best candidate).
         ElectionState election = new ElectionState(this.id, this.id, currentJac);
 
-        // Expect a reply from every current neighbour.
         for (Integer neighborId : neighbours.keySet()) {
             election.pendingChildren.add(neighborId);
         }
 
-        // Publish the wave so echo replies can find it.
         elections.put(messageId, election);
 
-        // Snapshot: blocking RMI calls run against a stable view; failures only
-        // prune this wave's pendingChildren, never the shared neighbour map.
-        // Copy of neighbours.
         List<Map.Entry<Integer, WorkerRemote>> snapshot = new ArrayList<>(neighbours.entrySet());
-        // Send the election message to every neighbour.
         for (Map.Entry<Integer, WorkerRemote> entry : snapshot) {
             try {
                 entry.getValue().receiveElectionMessage(this.id, this.id, currentJac, messageId);
             } catch (RemoteException e) {
-                // Peer is dead: stop waiting for it.
                 election.pendingChildren.remove(entry.getKey());
             }
         }
 
-        // No neighbours (or all dead) = wave is done, send our echo up immediately.
+        // No reachable neighbour, so this wave is already complete and echoes immediately.
         if (election.pendingChildren.isEmpty()) {
             propagateEcho(messageId, election);
         }
@@ -224,51 +183,37 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     }
 
     @Override
+    // Folds an incoming wave in: we win on lower JAC, then on higher id.
     public void receiveElectionMessage(int originId, int candidateId, int candidateJac, long messageId) throws RemoteException {
-        // Record the id as seen. This set is a record only: the duplicate guard
-        // is the elections.compute() below, NOT this set.
         seenMessageIds.add(messageId);
 
-        // Read our JAC for comparison.
         int currentJac = jobAllocationCounter.get();
-        // Start assuming the incoming candidate is best.
         int bestId = candidateId;
         int bestJac = candidateJac;
 
-        // Lower JAC wins (less-loaded worker leads).
         if (currentJac < bestJac) {
             bestId = this.id;
             bestJac = currentJac;
         } else if (currentJac == bestJac) {
-            // Tie: higher worker ID wins.
             if (this.id > bestId) {
                 bestId = this.id;
                 bestJac = currentJac;
             }
         }
 
-        // The comparison above reassigns these, so the lambda needs its own copy.
         final int ourBestId = bestId;
         final int ourBestJac = bestJac;
         final int parentId = originId;
 
-        // Claim the wave and publish its state in one atomic map operation.
-        // A separate put() left a gap in which a duplicate, or an echo from an
-        // already-forwarded child, saw the id as seen but found no state and was
-        // dropped - and a dropped echo strands that child in the parent's
-        // pendingChildren forever, deadlocking a wave that contains a cycle.
-        // compute() closes the gap, and running it before any fan-out means no
-        // echo can arrive before there is a state to merge into.
         final ElectionState[] created = new ElectionState[1];
         final ElectionState[] alreadySeen = new ElectionState[1];
+        // Claim and publish in one atomic step, so a duplicate never sees the id without state.
         elections.compute(messageId, (key, existing) -> {
             if (existing != null) {
                 alreadySeen[0] = existing;
                 return existing;
             }
-            // Track this wave with us remembering who sent it (parent).
             ElectionState election = new ElectionState(parentId, ourBestId, ourBestJac);
-            // Expect replies from all neighbours except the parent.
             for (Integer neighborId : neighbours.keySet()) {
                 if (neighborId != parentId) {
                     election.pendingChildren.add(neighborId);
@@ -278,21 +223,18 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
             return election;
         });
 
+        // Already seen this wave: answer the sender so it can finish, but do not forward again.
         ElectionState seen = alreadySeen[0];
         if (seen != null) {
-            // Already seen: answer the duplicate with our current best so the
-            // sender can finish. Read under the monitor, because that is where
-            // receiveEchoMessage merges candidates into it.
             int[] best = new int[2];
+                // Read the best candidate under the wave's lock so a concurrent echo cannot tear it.
             synchronized (seen) {
                 best[0] = seen.bestCandidateId;
                 best[1] = seen.bestCandidateJac;
             }
             try {
-                // Find who sent it.
                 WorkerRemote sender = neighbours.get(parentId);
                 if (sender != null) {
-                    // Answer the duplicate with our current best so the sender can finish.
                     sender.receiveEchoMessage(messageId, this.id, best[0], best[1]);
                 }
             } catch (RemoteException ignored) {}
@@ -301,51 +243,39 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
         ElectionState election = created[0];
 
-        // Snapshot so concurrent neighbour changes mid-wave cannot corrupt fan-out.
-        // Copy of neighbours.
+        // Forward to every neighbour except the one this wave arrived from.
         List<Map.Entry<Integer, WorkerRemote>> snapshot = new ArrayList<>(neighbours.entrySet());
-        // Forward to every neighbour except the parent.
         for (Map.Entry<Integer, WorkerRemote> entry : snapshot) {
             if (entry.getKey() != originId) {
                 try {
                     entry.getValue().receiveElectionMessage(this.id, ourBestId, ourBestJac, messageId);
                 } catch (RemoteException e) {
-                    // Dead peer: stop waiting for it.
+                    // Unreachable neighbour: stop waiting on it.
                     election.pendingChildren.remove(entry.getKey());
                 }
             }
         }
 
-        // No children = leaf node, echo back immediately.
         if (election.pendingChildren.isEmpty()) {
             propagateEcho(messageId, election);
         }
     }
 
     @Override
+    // Applies a coordinator announcement and relays it onward to the whole network.
     public void receiveCoordinatorMessage(int coordinatorId, long messageId) throws RemoteException {
-        // Drop repeats of the same announcement.
+        // First sighting; a broadcast that loops back to us stops here.
         if (!seenCoordinatorMessageIds.add(messageId)) {
             return;
         }
-        // Record the winner. Volatile write = all threads see it at once.
         this.currentCoordinatorId = coordinatorId;
-        // An election has concluded, so any handover this node started is over.
         handoverInProgress.set(false);
-        // A new term begins whenever this node is named coordinator, so the
-        // job budget restarts rather than carrying over from an earlier term.
-        // Every announcement that reaches a node now originates in a concluded
-        // election: a joining worker adopts locally instead of relaying, and the
-        // announcing node records the id before broadcasting, so a fresh id here
-        // means a genuinely new term rather than a repeat of the current one.
         if (coordinatorId == this.id) {
+            // Only a real new term resets the budget, never a relayed adoption.
             termJobsCoordinated.set(0);
         }
 
-        // Snapshot: relay runs on the calling RMI thread against a stable view.
-        // Copy of neighbours.
         List<Map.Entry<Integer, WorkerRemote>> snapshot = new ArrayList<>(neighbours.entrySet());
-        // Relay the winner to every neighbour so it reaches all hops.
         for (Map.Entry<Integer, WorkerRemote> entry : snapshot) {
             try {
                 entry.getValue().receiveCoordinatorMessage(coordinatorId, messageId);
@@ -353,22 +283,8 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
     }
 
-    /**
-     * Adopts a coordinator the cluster already elected, locally only.
-     *
-     * <p>A joining worker learns the current coordinator from a single peer and
-     * must not re-broadcast it: that peer already knows, and a relay would reach
-     * the coordinator under a fresh message id, which reads as a brand new term
-     * and hands the serving coordinator a second full job budget mid-term. Only
-     * a concluded election may start a new term, so adoption is deliberately not
-     * routed through the relaying {@link #receiveCoordinatorMessage}.
-     *
-     * <p>Not on {@link WorkerRemote}: it is a local call on this object, so the
-     * RMI interface and wire protocol are unchanged.
-     */
+    // Local only: a joiner learned this from one peer, and relaying would read as a new term.
     public void adoptCoordinator(int coordinatorId, long messageId) {
-        // Recorded so a later announcement carrying this same local id is
-        // recognised as already seen.
         seenCoordinatorMessageIds.add(messageId);
         this.currentCoordinatorId = coordinatorId;
         if (coordinatorId == this.id) {
@@ -377,75 +293,63 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     }
 
     @Override
+    // Folds a child's answer in and completes the wave once nobody is outstanding.
     public void receiveEchoMessage(long messageId, int fromWorkerId, int bestCandidateId, int bestCandidateJac) throws RemoteException {
-        // Find the matching wave.
         ElectionState election = elections.get(messageId);
-        // Unknown wave (late/old echo): ignore.
         if (election == null) {
             return;
         }
 
-        // Lock this wave so two echoes arriving together cannot corrupt the merge.
+        // Merging and the completeness test must be one critical section, or echoes race.
         synchronized (election) {
-            // Keep the lower JAC.
             if (bestCandidateJac < election.bestCandidateJac) {
                 election.bestCandidateId = bestCandidateId;
                 election.bestCandidateJac = bestCandidateJac;
             } else if (election.bestCandidateJac == bestCandidateJac) {
-                // Tie: keep the higher ID.
                 if (bestCandidateId > election.bestCandidateId) {
                     election.bestCandidateId = bestCandidateId;
                     election.bestCandidateJac = bestCandidateJac;
                 }
             }
 
-            // One child answered, stop waiting for it.
             election.pendingChildren.remove(fromWorkerId);
 
-            // All children answered and we haven't echoed yet: echo upward.
+                // Last outstanding child: complete the wave. The echoed latch keeps it once-only.
             if (election.pendingChildren.isEmpty() && !election.echoed) {
                 propagateEcho(messageId, election);
             }
         }
     }
 
+    // The root announces the winner; every other node relays the result upward.
     private void propagateEcho(long messageId, ElectionState election) {
-        // Lock + claim the echo so it is sent exactly once.
         synchronized (election) {
+            // Set under the lock, so concurrent triggers cannot announce twice.
             if (election.echoed) {
                 return;
             }
             election.echoed = true;
         }
 
-        // We started this wave: we now know the winner.
+        // We started this wave, so we are the root and decide the outcome.
         if (election.parentId == this.id) {
-            // Save the winner locally.
             this.currentCoordinatorId = election.bestCandidateId;
-            // The wave finished, so any handover this node started is over.
             handoverInProgress.set(false);
-            // Re-electing ourselves (a lone worker, or one whose peers all left)
-            // is a fresh term, so the job budget restarts.
             if (election.bestCandidateId == this.id) {
                 termJobsCoordinated.set(0);
             }
-            // Coordinator announcement ID derived from the election ID.
+            // Offset, so a coordinator announcement can never collide with an election id.
             long coordMessageId = messageId + 1000000L;
-            // Record it before broadcasting. Announcements travel in every
-            // direction, so without this the initiator meets its own broadcast
-            // coming back, treats it as new, and if it won, restarts its term
-            // budget a second time and relays the announcement again.
+            // Record before broadcasting, or our own announcement returns and resets the term.
             seenCoordinatorMessageIds.add(coordMessageId);
-            // Snapshot of neighbours for the broadcast.
             List<Map.Entry<Integer, WorkerRemote>> snapshot = new ArrayList<>(neighbours.entrySet());
-            // Announce the winner to all neighbours.
             for (Map.Entry<Integer, WorkerRemote> entry : snapshot) {
                 try {
                     entry.getValue().receiveCoordinatorMessage(election.bestCandidateId, coordMessageId);
                 } catch (RemoteException ignored) {}
             }
         } else {
-            // Forward our best upward to our parent.
+            // Send our merged best back to the node that forwarded this wave.
             WorkerRemote parentStub = neighbours.get(election.parentId);
             if (parentStub != null) {
                 try {
@@ -456,110 +360,80 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     }
 
     @Override
+    // Adds a peer by looking up its registry stub; also used for the reverse edge.
     public void connectAsNeighbour(int newWorker, String rmiHost, int rmiPort) throws RemoteException {
         try {
-            // Contact the new neighbour's registry.
             Registry registry = LocateRegistry.getRegistry(rmiHost, rmiPort);
-            // Look up its worker object.
             WorkerRemote stub = (WorkerRemote) registry.lookup("Worker" + newWorker);
-            // Save it (overwrites any old entry for that ID).
             neighbours.put(newWorker, stub);
         } catch (NotBoundException e) {
-            // Name not found: report failure.
             throw new RemoteException("Failed to look up new neighbour", e);
         }
     }
 
     @Override
+    // Coordinator-facing half: claim the job, then compute on a pool thread and report back.
     public void assignTask(int jobId, String jobType, Object payload) throws RemoteException {
-        // Group 6 — exactly-once per jobId: concurrent duplicate submissions
-        // (e.g. coordinator retries) collapse to a single execution. add() is
-        // atomic on the concurrent set. Distinct jobIds proceed in parallel.
-        // Note: the JAC is NOT incremented here. Per the spec and the Design
-        // Decisions note, JAC counts assignments issued by a coordinator, not
-        // work received. The coordinator increments it in submitJob().
-        // Claim this jobId; duplicates exit here.
+        // Already accepted (in flight or done), so treat this as a retry and ignore.
         if (!seenJobIds.add(jobId)) {
             return;
         }
 
-        // Distributed chunks carry the original coordinator's address, so results
-        // return correctly across neighbour hops and later leader changes.
+        // A TaskAssignment carries the chunk plus the coordinator to report the result to.
         final Object calculationPayload = payload instanceof TaskAssignment assignment
                 ? assignment.payload() : payload;
         final WorkerRemote resultReceiver = payload instanceof TaskAssignment assignment
                 ? assignment.coordinator() : null;
 
-        // Copy jobType for the background thread.
         final String typeSnapshot = jobType;
-        // Count the task as active BEFORE handing it to the pool.
-        // Recording it afterwards races the task's own cleanup: the pool thread
-        // can finish first, its removal finds nothing to remove, and the entry
-        // added afterwards is stranded - leaving getActiveTaskCount()
-        // over-reporting for good and inflating the JAC this node advertises in
-        // elections. Claiming it first means the task's removal always finds
-        // something to remove; the rejection handler below removes it too.
         activeTasks.add(jobId);
         try {
-            // Run the computation on a pool thread so this RMI call returns instantly.
             executor.submit(() -> {
-                // Holder for the answer.
                 Object computedResult;
                 try {
-                    // Delegate to the shared calculator (shares logic with the client preview).
                     computedResult = WorkerTaskCalculator.calculate(typeSnapshot, calculationPayload);
                 } catch (Exception e) {
-                    // Turn crashes into an error message.
                     computedResult = "Error executing task: " + e.getMessage();
                 }
 
                 try {
-                    // Single volatile read: route on a consistent snapshot so a
-                    // coordinator change mid-task cannot split the branch.
-                    // One read of the leader.
                     int targetCoordinator = currentCoordinatorId;
-                    // We are the leader (or none known): keep the result locally.
+                    // Prefer the coordinator that dispatched us; fall back to whoever leads now.
                     if (resultReceiver != null) {
                         resultReceiver.reportTaskResult(jobId, id, computedResult);
                     } else if (targetCoordinator == id || targetCoordinator == -1) {
                         reportTaskResult(jobId, id, computedResult);
                     } else {
-                        // Look up the leader's connection.
                         WorkerRemote coordinatorStub = neighbours.get(targetCoordinator);
                         if (coordinatorStub != null) {
-                            // Send the answer to the leader.
                             coordinatorStub.reportTaskResult(jobId, id, computedResult);
                         } else {
-                            // Leader unreachable: store locally instead of dropping it.
                             reportTaskResult(jobId, id, computedResult);
                         }
                     }
                 } catch (RemoteException ignored) {
                 } finally {
-                    // No longer running.
+                    // Always clear the active marker, even when delivery failed.
                     activeTasks.remove(jobId);
                 }
             });
         } catch (RejectedExecutionException e) {
-            // Pool shut down / saturated: release the claim so a retry can be accepted later.
-            // Forget the tracking entry.
+            // Pool refused the work, so undo the claim and let the job be retried elsewhere.
             activeTasks.remove(jobId);
-            // Release the jobId claim so a later retry can run.
             seenJobIds.remove(jobId);
-            // Tell the caller it was rejected.
             throw new RemoteException("Worker overloaded, task rejected for job " + jobId, e);
         }
     }
 
     @Override
+    // Accepts a participant's result once; unknown jobs are simply stored.
     public void reportTaskResult(int jobId, int workerId, Object result) throws RemoteException {
         JobState state = coordinatingJobs.get(jobId);
         if (state == null) {
             taskResults.putIfAbsent(new JobResultKey(jobId, workerId), result);
             return;
         }
-        // Accept each expected worker only once. Store its answer before marking
-        // it finished, so the last callback sees every partial result.
+        // Per-job lock: record the result and retire the expected participant together.
         synchronized (state) {
             if (!state.expected().contains(workerId)) return;
             taskResults.put(new JobResultKey(jobId, workerId), result);
@@ -568,11 +442,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         finishJobIfReady(jobId, state);
     }
 
+    // Delivers the aggregate exactly once, then spends the term if it is used up.
     private void finishJobIfReady(int jobId, JobState state) {
-        // A fast calculation may finish while dispatch is still running. Wait for
-        // both dispatch and every expected answer before sending one final result.
         synchronized (state) {
             if (!state.dispatchComplete().get() || !state.expected().isEmpty()
+                    // remove(jobId,state) is the once-only gate: only the thread winning it delivers.
                     || !coordinatingJobs.remove(jobId, state)) return;
         }
         Object result = aggregateJob(state.jobType(), jobId);
@@ -580,59 +454,47 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         maybeRotateCoordinator();
     }
 
-    /**
-     * Called by a Client via RMI. This node must currently be the coordinator:
-     * it splits the payload across itself and its neighbours, tracks the pieces
-     * in progress, and reports the aggregated result back to the client.
-     */
     @Override
+    // Coordinator entry point: split the job, dispatch every slice, track who must reply.
     public void submitJob(int jobId, String jobType, Object payload, String clientHost, int clientPort, String clientName) throws RemoteException {
+        // Only the current coordinator may split work.
         if (currentCoordinatorId != id) {
             throw new RemoteException("Worker " + id + " is not the current coordinator (coordinator=" + currentCoordinatorId + ")");
         }
-        // A spent term is refused from the moment its budget is reset until the
-        // handover completes, so no job can slip into a term the spec has
-        // already spent. Retryable: the client re-discovers the coordinator.
+        // Refuse during handover, so a term never serves beyond its budget.
         if (handoverInProgress.get()) {
             throw new RemoteException("Worker " + id + " is handing over leadership after a spent term; retry against the new coordinator");
         }
-        // Use bootstrap to find all registered workers without adding election
-        // neighbours. Tests without bootstrap retain their directly connected peers.
         Map<Integer, WorkerRemote> available = discoverJobWorkers();
         List<Integer> participants = new ArrayList<>();
         participants.add(id);
+        // Coordinator first, then peers in id order, for a deterministic split.
         available.keySet().stream().filter(workerId -> workerId != id).sorted().forEach(participants::add);
         List<Object> chunks = splitPayload(jobType, payload, participants.size());
         if (!submittedJobIds.add(jobId)) return;
 
-        // This job counts against the current term. Reserving here, after the
-        // duplicate guard, means an accepted job is counted exactly once.
-        // The reservation never writes a value above JOBS_PER_TERM, because
-        // maybeRotateCoordinator() resets the counter concurrently: with an
-        // increment-then-check scheme a request can observe 6, the reset can
-        // land in between, and the late undo would drive the counter to -1 -
-        // after which no term would ever reach its limit again.
         final boolean termExhausted = reserveTermSlot(jobId);
 
-        // Register the entire job before any thread can report a result.
         Set<Integer> expected = ConcurrentHashMap.newKeySet();
         for (int i = 0; i < participants.size(); i++) {
+            // A participant with no chunk never reports back, so it is not expected.
             if (chunks.get(i) != null) expected.add(participants.get(i));
         }
         JobState state = new JobState(jobType, expected, clientHost, clientPort, clientName, new AtomicBoolean());
         coordinatingJobs.put(jobId, state);
+        // Peers report through this stub, so results still reach us if leadership moves.
         WorkerRemote callback = (WorkerRemote) UnicastRemoteObject.toStub(this);
 
         final String typeSnapshot = jobType;
         for (int i = 0; i < participants.size(); i++) {
             Object chunk = chunks.get(i);
             if (chunk == null) {
-                continue; // empty slice for this participant
+                continue;
             }
             int targetId = participants.get(i);
             if (targetId == id) {
-                // Our own share: compute locally on a pool thread.
                 final Object selfChunk = chunk;
+                // Our own slice runs on the pool too, so the caller's RMI thread is never blocked.
                 executor.submit(() -> {
                     Object result;
                     try {
@@ -646,11 +508,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                     }
                 });
             } else {
-                // Assigning to another worker: this is what counts against the JAC.
+                // JAC counts only work handed to others, which is what the election compares.
                 jobAllocationCounter.incrementAndGet();
                 WorkerRemote stub = available.get(targetId);
                 if (stub == null) {
-                    // The neighbour vanished mid-dispatch: compute its slice locally instead.
+                    // In the directory but unreachable: compute its slice here rather than stall.
                     final Object slice = chunk;
                     executor.submit(() -> {
                         try {
@@ -663,8 +525,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 try {
                     stub.assignTask(jobId, typeSnapshot, new TaskAssignment(chunk, callback));
                 } catch (RemoteException e) {
-                    // Dead participant: forget it and compute its slice locally so
-                    // the job still completes with the correct aggregate.
+                    // Drop the dead peer and cover its slice locally so the job still completes.
                     neighbours.remove(targetId);
                     final Object slice = chunk;
                     executor.submit(() -> {
@@ -682,22 +543,16 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 }
             }
         }
+        // Set only after every slice is dispatched, so we cannot aggregate early.
         state.dispatchComplete().set(true);
         finishJobIfReady(jobId, state);
+        // This job spent the budget, so rotate once its result has been delivered.
         if (termExhausted) {
             maybeRotateCoordinator();
         }
     }
 
-    /**
-     * Claims one job slot in the current term, rejecting once it is full.
-     *
-     * <p>Returns whether the caller filled the term and so has to hand over
-     * leadership. A full term refuses the job rather than queueing it, so "at
-     * most JOBS_PER_TERM jobs" holds under concurrent submissions. A refused job
-     * gives its id back, so a client retry against the new coordinator is not
-     * mistaken for a duplicate.
-     */
+    // Reserves one slot in the term; returns true when that job spent the budget.
     private boolean reserveTermSlot(int jobId) throws RemoteException {
         while (true) {
             int used = termJobsCoordinated.get();
@@ -706,15 +561,18 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 throw new RemoteException("Worker " + id + " has coordinated the maximum of "
                         + Constants.JOBS_PER_TERM + " jobs for this term; it is handing over leadership");
             }
+            // Increment and check are one CAS, so the count is never observable above the cap.
             if (termJobsCoordinated.compareAndSet(used, used + 1)) {
                 return used + 1 == Constants.JOBS_PER_TERM;
             }
         }
     }
 
+    // Asks the directory for every active worker, so work reaches beyond our neighbours.
     private Map<Integer, WorkerRemote> discoverJobWorkers() throws RemoteException {
         Map<Integer, WorkerRemote> workers = new HashMap<>();
         BootstrapRemote directory = bootstrap;
+        // No directory (tests): our neighbours are the whole cluster.
         if (directory == null) {
             workers.putAll(neighbours);
         } else {
@@ -725,26 +583,27 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                 try {
                     WorkerRemote worker = (WorkerRemote) LocateRegistry.getRegistry(
                             address.getRmiHost(), address.getRmiPort()).lookup("Worker" + workerId);
+                        // Skip workers the directory still lists but that no longer answer.
                     if (worker.isActive()) workers.put(workerId, worker);
                 } catch (RemoteException | NotBoundException ignored) {
-                    // Skip stale registrations; split the job among reachable workers.
                 }
             }
         }
+        // We always take part in our own job.
         workers.put(id, this);
         return workers;
     }
 
-    /** Slice a payload into `parts` roughly equal slices; empty slices are null. */
     private List<Object> splitPayload(String jobType, Object payload, int parts) {
         List<Object> chunks = new ArrayList<>(WorkerTaskDistributor.split(jobType, payload, parts));
+        // Pad with nulls so chunk i always belongs to participant i.
         while (chunks.size() < parts) {
             chunks.add(null);
         }
         return chunks;
     }
 
-    /** Combine the per-worker pieces once every participant has reported. */
+    // Combines numeric partials; a non-numeric partial is passed through as-is.
     private Object aggregateJob(String jobType, int jobId) {
         Map<Integer, Object> results = getJobResults(jobId);
         List<Number> partialResults = new ArrayList<>(results.size());
@@ -761,7 +620,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
     }
 
-    /** Send the final answer back to the client that submitted the job. */
+    // Calls the client back on its own registry; a dead client must not fail the job.
     private void deliverToClient(int jobId, Object result, JobState state) {
         try {
             Registry clientRegistry = LocateRegistry.getRegistry(state.clientHost(), state.clientPort());
@@ -773,38 +632,24 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
     }
 
-    /**
-     * Term expiry: after Constants.JOBS_PER_TERM client jobs the coordinator
-     * yields by starting a new election; the lowest-JAC worker wins and
-     * leadership rotates. The counter is per job, not per assignment.
-     */
+    // Resets the budget and starts the next election in one CAS, so one thread hands over.
     private void maybeRotateCoordinator() {
-        // Reset the budget and start the election as one step. A plain
-        // get()-then-set() let two threads both observe a full term and both
-        // start an election, and since each election picks its own best
-        // candidate from the JACs it happens to see, two of them can disagree
-        // about the leader. The CAS makes exactly one thread win the reset, so
-        // one term produces exactly one election; a value that is already reset
-        // fails to match, which is the "someone else is rotating" case.
         while (true) {
             int used = termJobsCoordinated.get();
             if (used < Constants.JOBS_PER_TERM) {
                 return;
             }
+            // One step means exactly one handover; a loser retries and sees the reset.
             if (termJobsCoordinated.compareAndSet(used, 0)) {
-                // Close the handover window before the wave starts: from here
-                // until a coordinator is announced this node is no longer a
-                // valid destination for work, despite still being named.
                 handoverInProgress.set(true);
+                // Gate submitJob before the election, closing the window where a term overserves.
                 startElection();
                 return;
             }
         }
     }
 
-    // ---- Heartbeat / coordinator-failure detection ----
-
-    /** Wires the bootstrap reference and starts the periodic probe. */
+    // Join point: store the directory and start probing the coordinator.
     public void setBootstrapReference(BootstrapRemote bootstrap, String localHost) {
         this.bootstrap = bootstrap;
         heartbeatExecutor.scheduleAtFixedRate(this::heartbeatTick,
@@ -813,15 +658,15 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
     @Override
     public void ping() throws RemoteException {
-        // Reachable = alive. No work to do; just being exported is enough.
     }
 
+    // Probes the coordinator; an unanswered ping means failure, so start an election.
     private void heartbeatTick() {
         int coord = currentCoordinatorId;
         if (coord == -1 || coord == id || bootstrap == null) {
             return;
         }
-        // Skip this beat if the last probe is still outstanding.
+        // One probe at a time, so a slow coordinator cannot pile up overlapping calls.
         if (!heartbeatInFlight.compareAndSet(false, true)) {
             return;
         }
@@ -833,13 +678,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
             try {
                 stub.ping();
             } catch (RemoteException e) {
-                // Coordinator did not answer: treat it as dead and re-elect.
                 coordinatorStub = null;
+                // Drop the cached stub so the next tick re-resolves it from the directory.
                 startElection();
             }
         } catch (Exception e) {
-            // Not bound, lookup failed, or bootstrap unreachable: assume the
-            // coordinator is gone.
             coordinatorStub = null;
             startElection();
         } finally {
@@ -847,6 +690,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
     }
 
+    // Reuse the cached stub while the coordinator is unchanged, else look it up again.
     private WorkerRemote resolveCoordinatorStub(int coord) {
         if (coordinatorStub != null && cachedCoordinatorId == coord) {
             return coordinatorStub;
@@ -866,34 +710,23 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
     }
 
-    /**
-     * Group 6 lifecycle: stop accepting new tasks and finish in-flight ones.
-     * Called from the WorkerNode shutdown hook; tests may also call it to avoid
-     * leaking pool threads across test cases.
-     */
+    // Stops both pools; daemon threads mean a missed call cannot block JVM exit.
     public void shutdown() {
-        // Stop the pool (lets running jobs finish).
         executor.shutdown();
-        // Stop the heartbeat scheduler (daemon, but clean shutdown is tidy).
         heartbeatExecutor.shutdown();
     }
 
     public boolean isShutdown() {
-        // Report whether shutdown was called.
         return executor.isShutdown();
     }
 
-    /** Latest result reported for a (jobId, workerId) pair, or null if none yet. */
     public Object getTaskResult(int jobId, int workerId) {
-        // Look up one worker's answer.
         return taskResults.get(new JobResultKey(jobId, workerId));
     }
 
-    /** Snapshot of all per-worker results collected locally for a job. Never null. */
     public Map<Integer, Object> getJobResults(int jobId) {
-        // Fresh map for the answer.
+    // Flattens the composite key into workerId -> result for a single job.
         Map<Integer, Object> out = new HashMap<>();
-        // Collect every worker's answer for this job.
         for (Map.Entry<JobResultKey, Object> e : taskResults.entrySet()) {
             if (e.getKey().jobId() == jobId) {
                 out.put(e.getKey().workerId(), e.getValue());
@@ -902,9 +735,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         return out;
     }
 
-    /** Number of in-flight (accepted but not yet finished) tasks. */
     public int getActiveTaskCount() {
-        // Count running jobs.
         return activeTasks.size();
     }
 }

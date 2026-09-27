@@ -18,16 +18,10 @@ import java.rmi.server.UnicastRemoteObject;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * Coordinator-announcement handling around a winning election initiator.
- *
- * A two-node ring, so the announcement the initiator broadcasts comes straight
- * back to it. That loop-back is the whole point: the initiator records the
- * announcement id before broadcasting, so meeting its own message is recognised
- * as the repeat it is. Without that record it treats the message as new, and
- * because it is the one that won, it restarts its term budget and floods the
- * ring a second time.
- */
+// Loop-back of a coordinator announcement into the worker that broadcast it.
+// In a two-node ring the initiator's own broadcast returns to it; recording the id
+// first is what makes that a repeat to drop. Treating it as new would reset the
+// winner's term budget and flood the ring a second time.
 class WorkerElectionAnnouncementTest {
 
     private static final int TEST_RMI_PORT = 19809;
@@ -35,7 +29,9 @@ class WorkerElectionAnnouncementTest {
 
     private static Registry registry;
 
+    // The winning initiator; its only neighbour is the double, making a two-node ring.
     private WorkerRemoteImpl w1;
+    // Completes the wave and relays announcements back, so the loop-back is real.
     private EchoingWorkerRemote peer;
 
     @BeforeAll
@@ -54,10 +50,10 @@ class WorkerElectionAnnouncementTest {
         registry.rebind("Worker1", w1);
 
         // The double answers elections and relays announcements, so the wave
-        // finishes and the announcement travels. A worse JAC makes worker 1 the
-        // winner, which is the case where re-processing the loop-back resets a
-        // budget.
+        // finishes and the announcement travels. A worse JAC makes worker 1 win, which is
+        // the case where re-processing the loop-back would reset a budget.
         peer = new EchoingWorkerRemote(2);
+        // JAC 5 against worker 1's zero, so the initiator wins and risks a budget reset.
         peer.setJobAllocationCounter(5);
         registry.rebind("Worker2", peer);
         peer.relayAnnouncementsTo((WorkerRemote) registry.lookup("Worker1"));
@@ -78,6 +74,7 @@ class WorkerElectionAnnouncementTest {
         unexportQuietly(peer);
     }
 
+    // Constructing a worker exports it, so each test releases its own RMI endpoint.
     private void unexportQuietly(Remote remoteObject) {
         if (remoteObject == null) {
             return;
@@ -88,11 +85,14 @@ class WorkerElectionAnnouncementTest {
         }
     }
 
+    // Counted on the double, which is the only node that can witness a relay.
     private long countCalls(String prefix) {
         return peer.calls().stream().filter(call -> call.startsWith(prefix)).count();
     }
 
     @Test
+    // The winner records its own announcement id before broadcasting, so the loop-back
+    // is a repeat it can drop rather than a new term that would restart its budget.
     void aWinningInitiatorDoesNotReprocessItsOwnAnnouncement() throws Exception {
         w1.startElection();
 
@@ -109,7 +109,7 @@ class WorkerElectionAnnouncementTest {
                         + peer.calls());
     }
 
-    /** The id of the single coordinator announcement the peer recorded. */
+    // The single coordinator announcement id the double recorded.
     private long announcementIdFrom(EchoingWorkerRemote recorder) {
         for (String call : recorder.calls()) {
             if (call.startsWith("coordinator|")) {

@@ -18,21 +18,11 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * Step 4 of the worker test plan: receiveEchoMessage() and the echo propagation
- * it drives.
- *
- * This is where the election actually terminates. A node forwards the ELECTION
- * outward and then has to wait for every one of its children to report back.
- * Only when the last child has answered does it pass the running best candidate
- * up to its parent - and the initiator, which has no parent, is the node that
- * finally declares the winner and announces it.
- *
- * Termination is therefore an exact, local condition ("every child replied"),
- * not a timeout. These tests pin that down, plus the once-only guard that stops
- * a repeated echo from being propagated twice, and the case where a node has
- * more than one child and has to wait for all of them.
- */
+// receiveEchoMessage() and the propagation it drives: this is where a wave ends.
+// A node reports upward only once every child has answered, and the initiator,
+// having no parent, is the node that declares and announces the winner.
+// Termination is a local condition, never a timeout, and a once-only latch keeps a
+// repeated answer from being propagated a second time.
 class WorkerEchoTest {
 
     private static final int TEST_RMI_PORT = 19803;
@@ -41,6 +31,7 @@ class WorkerEchoTest {
 
     private static Registry registry;
 
+    // Node 1 sits between a parent it must report to and children that owe it echoes.
     private WorkerRemoteImpl worker;      // id 1 - the node under test
     private RecordingWorkerRemote parent; // id 2 - who the echo must be sent up to
     private RecordingWorkerRemote child;  // id 3 - who owes this node an echo
@@ -62,6 +53,7 @@ class WorkerEchoTest {
         parent = new RecordingWorkerRemote(2);
         child = new RecordingWorkerRemote(3);
 
+        // Bindings let the worker resolve neighbours by name, as a real join would.
         registry.rebind("Worker2", parent);
         registry.rebind("Worker3", child);
 
@@ -80,6 +72,7 @@ class WorkerEchoTest {
         unexportQuietly(otherChild);
     }
 
+    // RMI export is a side effect of construction, so every test unexports its doubles.
     private void unexportQuietly(Remote remoteObject) {
         if (remoteObject == null) {
             return;
@@ -91,20 +84,23 @@ class WorkerEchoTest {
         }
     }
 
+    // Echoes are counted from the parent's call log, so a second send becomes visible.
     private static long countOf(List<String> calls, String prefix) {
         return calls.stream().filter(call -> call.startsWith(prefix)).count();
     }
 
+    // Winner announcements are checked on the child, which has no parent to report to.
     private static boolean receivedCoordinatorFor(List<String> calls, int coordinatorId) {
         return calls.stream().anyMatch(call -> call.startsWith("coordinator|" + coordinatorId + "|"));
     }
 
-    /** Puts this worker in the middle of an election: parent = 2, only child = 3. */
+    // Puts this worker mid-election: parent 2 has forwarded, child 3 still owes an echo.
     private void receiveElectionFromParent() throws Exception {
         worker.receiveElectionMessage(2, 2, 0, ELECTION_ID);
     }
 
     @Test
+    // With its only child answered, this node's subtree is complete and must report up.
     void theLastEchoIsForwardedUpToTheParent() throws Exception {
         receiveElectionFromParent();
 
@@ -116,6 +112,7 @@ class WorkerEchoTest {
     }
 
     @Test
+    // The once-only latch is what stops a duplicate answer echoing a second time.
     void aRepeatedEchoFromTheSameChildIsNotPropagatedTwice() throws Exception {
         receiveElectionFromParent();
 
@@ -128,6 +125,7 @@ class WorkerEchoTest {
     }
 
     @Test
+    // Termination means every child replied, so one answer out of two is not enough.
     void waitsForAllChildrenBeforeEchoingToParent() throws Exception {
         otherChild = new RecordingWorkerRemote(4);
         registry.rebind("Worker4", otherChild);
@@ -155,7 +153,9 @@ class WorkerEchoTest {
     }
 
     @Test
+    // The initiator has no parent, so completing its wave is what declares the winner.
     void theInitiatorAnnouncesTheWinnerOnceEveryChildHasEchoed() throws Exception {
+        // A second, unattached worker: only the child's echo can complete this wave.
         WorkerRemoteImpl initiator = new WorkerRemoteImpl(1);
         try {
             initiator.connectAsNeighbour(3, HOST, TEST_RMI_PORT);

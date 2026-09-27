@@ -12,18 +12,17 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * BootstrapNode.main() calls System.exit() on failure, which would kill the
- * test JVM itself if called directly. So these tests launch it as a real,
- * separate process (the same way you'd actually run it) and check its exit
- * code / console output from the outside instead.
- */
+// BootstrapNode.main() calls System.exit() on failure, which would kill the test JVM itself.
+// Each test therefore launches it as a real child process, the way it is actually run.
+// Its exit code and console output are then read from the outside, not in-process.
 class BootstrapNodeTest {
 
     // Maven puts compiled classes here by default.
     private static final String CLASSPATH = "target/classes";
+    // A port nothing else in the suite binds, so the child cannot collide with another test.
     private static final int TEST_PORT = 18799;
 
+    // Tracked so tearDown can kill a survivor; a leaked node would keep holding the port.
     private Process runningProcess;
 
     @AfterEach
@@ -82,9 +81,7 @@ class BootstrapNodeTest {
         runningProcess = startBootstrap(String.valueOf(TEST_PORT));
         readAvailableOutput(runningProcess); // let it finish starting up
 
-        // Second process tries the same port and should fail *and actually exit*
-        // (this is the bug that was found and fixed - it used to hang forever
-        // instead of exiting after printing the failure message).
+        // The second node must print the failure *and* exit; it used to hang forever instead.
         Process second = startBootstrap(String.valueOf(TEST_PORT));
         boolean exitedInTime = second.waitFor(5, TimeUnit.SECONDS);
 

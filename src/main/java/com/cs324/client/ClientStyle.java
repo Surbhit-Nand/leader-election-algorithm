@@ -5,8 +5,9 @@ import javax.swing.border.AbstractBorder;
 import java.awt.*;
 import java.awt.geom.Path2D;
 
-/** Reusable painting helpers for the client; contains no job-processing logic. */
+// Static style and painting helper holder for the client; it carries no job logic.
 final class ClientStyle {
+    // One palette and one font family, so no component can drift out of theme.
     static final Color BACKGROUND = new Color(244, 248, 255);
     static final Color INK = new Color(14, 28, 65);
     static final Color MUTED = new Color(91, 109, 151);
@@ -15,9 +16,10 @@ final class ClientStyle {
     static final Color LIGHT_BLUE = new Color(235, 240, 255);
     static final Font BODY = new Font("Segoe UI", Font.PLAIN, 14);
 
+    // Never instantiated: every widget and constant here is static.
     private ClientStyle() { }
 
-    /** Keep cards readable on small screens by scrolling instead of crushing their contents. */
+    // Scrollable card host, so a short window scrolls the cards instead of crushing them.
     static final class Workspace extends JPanel implements Scrollable {
         Workspace() { super(new BorderLayout(0, 14)); setOpaque(false); }
         public Dimension getPreferredScrollableViewportSize() { return getPreferredSize(); }
@@ -25,13 +27,14 @@ final class ClientStyle {
         public int getScrollableBlockIncrement(Rectangle visible, int orientation, int direction) {
             return Math.max(20, visible.height - 40);
         }
+        // Width always fills the viewport; height only when the content already fits.
         public boolean getScrollableTracksViewportWidth() { return true; }
         public boolean getScrollableTracksViewportHeight() {
             return getParent() != null && getParent().getHeight() >= getPreferredSize().height;
         }
     }
 
-    /** Every custom shape uses antialiasing so rounded edges stay smooth. */
+    // Antialiasing is enabled once here so every custom shape below stays smooth.
     static Graphics2D graphics(Graphics source) {
         Graphics2D g = (Graphics2D) source.create();
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
@@ -39,12 +42,13 @@ final class ClientStyle {
         return g;
     }
 
-    /** White section with a soft shadow, keeping the layout separate from its painting. */
+    // White section with a soft shadow, keeping layout decisions out of the painting.
     static JPanel card(LayoutManager layout) {
         JPanel panel = new JPanel(layout) {
             @Override
             protected void paintComponent(Graphics source) {
                 Graphics2D g = graphics(source);
+                // Stacked translucent fills fake a soft shadow without loading any image.
                 for (int i = 5; i >= 1; i--) {
                     g.setColor(new Color(66, 94, 155, 3));
                     g.fillRoundRect(6 - i, 6 - i, getWidth() - 12 + i * 2,
@@ -60,7 +64,7 @@ final class ClientStyle {
         return panel;
     }
 
-    /** A subtle server illustration, painted behind the heading without image files. */
+    // Decorative server graphic painted behind the heading, so no asset files are needed.
     static JPanel header() {
         JPanel panel = new JPanel(new BorderLayout(20, 0)) {
             @Override
@@ -90,13 +94,15 @@ final class ClientStyle {
         return panel;
     }
 
-    /** Rounded outlines for input controls; dashed outlines identify the empty state. */
+    // Rounded outline for input controls; the dashed variant marks the empty state.
     static final class RoundBorder extends AbstractBorder {
+        // Dashed marks the empty-state placeholder rather than a real input control.
         private final boolean dashed;
         RoundBorder(boolean dashed) { this.dashed = dashed; }
         @Override
         public Insets getBorderInsets(Component c) { return new Insets(7, 9, 7, 9); }
         @Override
+        // The copy overload exists so callers can reuse an Insets they already hold.
         public Insets getBorderInsets(Component c, Insets insets) {
             insets.set(7, 9, 7, 9);
             return insets;
@@ -104,6 +110,7 @@ final class ClientStyle {
         @Override
         public void paintBorder(Component c, Graphics source, int x, int y, int w, int h) {
             Graphics2D g = graphics(source);
+            // Focus recolours the outline, so keyboard users can see where they are.
             g.setColor(c.hasFocus() ? BLUE : LINE);
             g.setStroke(dashed
                     ? new BasicStroke(1.2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 1, new float[]{4, 4}, 0)
@@ -113,7 +120,7 @@ final class ClientStyle {
         }
     }
 
-    /** Draws guidance only when empty; the hint never becomes submitted input. */
+    // Guidance painted only while empty, so the hint can never be submitted by accident.
     static final class InputArea extends JTextArea {
         private String hint = "Enter integers separated by commas...";
         InputArea() { super(3, 35); }
@@ -121,6 +128,7 @@ final class ClientStyle {
         @Override
         protected void paintComponent(Graphics source) {
             super.paintComponent(source);
+            // Any text at all retires the hint; there is no placeholder value to select.
             if (!getText().isEmpty()) return;
             Graphics2D g = graphics(source);
             g.setFont(getFont());
@@ -131,21 +139,24 @@ final class ClientStyle {
         }
     }
 
-    /** Painted button surfaces preserve Swing's click, keyboard and focus behaviour. */
+    // Painted surface only; Swing still handles clicks, mnemonics and focus for these.
     static JButton button(String text, String symbol, boolean primary) {
         JButton button = new JButton(text, icon(symbol, 19, primary ? Color.WHITE : BLUE)) {
             @Override
+            // Surface first, super afterwards, so the label and icon still render on top.
             protected void paintComponent(Graphics source) {
                 Graphics2D g = graphics(source);
                 boolean pressed = getModel().isPressed();
                 boolean hover = getModel().isRollover();
                 Color top = primary ? new Color(84, 103, 228) : new Color(247, 249, 255);
                 Color bottom = primary ? BLUE : new Color(238, 243, 255);
+                // Hover and press darken the gradient, so the button reads as interactive.
                 if (pressed || hover) { top = primary ? BLUE.darker() : LIGHT_BLUE; }
                 g.setPaint(new GradientPaint(0, 0, top, 0, getHeight(), bottom));
                 g.fillRoundRect(1, 1, getWidth() - 3, getHeight() - 3, 19, 19);
                 g.setColor(primary ? BLUE : LINE);
                 g.drawRoundRect(1, 1, getWidth() - 3, getHeight() - 3, 19, 19);
+                // A second ring marks focus, independent of the platform look and feel.
                 if (hasFocus()) {
                     g.setColor(primary ? Color.WHITE : BLUE);
                     g.drawRoundRect(4, 4, getWidth() - 9, getHeight() - 9, 14, 14);
@@ -154,6 +165,7 @@ final class ClientStyle {
                 super.paintComponent(source);
             }
         };
+        // Hand-rolled UI with content and paint disabled: the surface above is the button.
         button.setUI(new javax.swing.plaf.basic.BasicButtonUI());
         button.setContentAreaFilled(false);
         button.setBorderPainted(false);
@@ -166,17 +178,20 @@ final class ClientStyle {
         return button;
     }
 
-    /** Small vector icons avoid external assets and missing Unicode glyphs. */
+    // Small vector icons avoid external asset files and missing Unicode glyphs.
     static Icon icon(String name, int size, Color color) {
         return new Icon() {
             public int getIconWidth() { return size; }
             public int getIconHeight() { return size; }
             public void paintIcon(Component c, Graphics source, int x, int y) {
+                // Copy, so the caller's transform and hints are not mutated while drawing.
                 Graphics2D g = graphics(source);
                 g.translate(x, y);
+                // Paths are authored on a 24x24 grid, then scaled to the requested size.
                 g.scale(size / 24.0, size / 24.0);
                 g.setColor(color);
                 g.setStroke(new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+                // An unknown name falls through to the default document glyph.
                 switch (name) {
                     case "play" -> g.fillPolygon(new int[]{6, 6, 20}, new int[]{3, 21, 12}, 3);
                     case "folder" -> {
@@ -226,10 +241,11 @@ final class ClientStyle {
         };
     }
 
-    /** Section icons sit in a tinted circle, like the reference design. */
+    // Section icon inside a tinted circle, matching the heading design.
     static JLabel badge(String symbol) {
         JLabel badge = new JLabel(icon(symbol, 24, BLUE), SwingConstants.CENTER) {
             @Override
+            // Tinted disc painted before the label, so the glyph sits inside a badge.
             protected void paintComponent(Graphics source) {
                 Graphics2D g = graphics(source);
                 g.setColor(LIGHT_BLUE); g.fillOval(0, 0, 48, 48); g.dispose();

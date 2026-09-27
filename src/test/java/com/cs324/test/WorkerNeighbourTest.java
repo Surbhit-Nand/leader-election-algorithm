@@ -18,25 +18,21 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * Step 1 of the worker test plan: connectAsNeighbour().
- *
- * Workers can only form the unstructured network if connectAsNeighbour does two
- * things: (a) resolve the other worker through its RMI registry, and (b) record
- * it locally so later messages can be forwarded to it.
- *
- * (a) is assertable directly. (b) has no neighbour getter, so it is proven
- * indirectly - once connected, a relayed message has to actually arrive at the
- * neighbour. That keeps the test honest without reaching into private state.
- */
+// Step 1 of the worker test plan: connectAsNeighbour().
+// The network only forms if connecting both resolves the peer through RMI and records it.
+// Resolution is assertable directly; recording has no getter, so it is proven indirectly.
+// Once connected, a relayed message has to actually arrive at the neighbour.
 class WorkerNeighbourTest {
 
     private static final int TEST_RMI_PORT = 19801;
     private static final String HOST = "localhost";
 
+    // Shared across tests; recreating an RMI registry on one port between tests is flaky.
     private static Registry registry;
 
+    // A real worker, so the production connect path is what is under test.
     private WorkerRemoteImpl worker;
+    // Created per test by the tests that need one; tearDown tolerates it staying null.
     private RecordingWorkerRemote neighbour;
 
     @BeforeAll
@@ -99,8 +95,8 @@ class WorkerNeighbourTest {
 
         worker.connectAsNeighbour(2, HOST, TEST_RMI_PORT);
 
-        // receiveCoordinatorMessage relays to every recorded neighbour, so if the
-        // connection was stored, that is where it becomes visible.
+        // Announcement relaying reaches every recorded neighbour, which is the proof.
+        // A fixed message id keeps the assertion exact without involving an election.
         worker.receiveCoordinatorMessage(2, 500L);
 
         assertTrue(neighbour.receivedCoordinator(2, 500L),

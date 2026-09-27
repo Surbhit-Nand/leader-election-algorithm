@@ -23,37 +23,30 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * Step 2 of the worker test plan: startElection().
- *
- * An initiator has to seed its own election state with itself as the parent, so
- * that once every subtree has echoed back it is the node that decides the winner
- * and announces the coordinator.
- *
- * A lone worker has no neighbours, so there is nothing to wait for: the election
- * must resolve immediately to itself.
- *
- * Most of these need no registry or peers - startElection on a worker with no
- * neighbours is entirely local. The one exception is the fan-out test, which
- * needs a real registry to hand out RMI stubs for the neighbours, because
- * "did the neighbour really receive it over RMI?" is the whole point of it.
- */
+// startElection(): the initiator seeds its own election state with itself as the
+// parent, so once every subtree has echoed back it is the node that decides the
+// winner and announces the coordinator.
+// A lone worker has nothing to wait for and must resolve to itself immediately.
+// Most of these need no peers at all; only the fan-out test needs a real registry,
+// because 'did the neighbour receive it over RMI?' is the whole point of it.
 class WorkerStartElectionTest {
 
     private static final int TEST_RMI_PORT = 19807;
     private static final String HOST = "localhost";
 
-    /** How many back-to-back elections to start when checking that ids do not repeat. */
+    // Enough back-to-back elections that a repeated id would show up.
     private static final int RAPID_ELECTIONS = 100;
 
     private static Registry registry;
 
     private WorkerRemoteImpl worker;
     private WorkerRemoteImpl otherWorker;
+    // Doubles stand in for peers, so what worker 1 actually sent is observable.
     private RecordingWorkerRemote neighbourTwo;   // id 2 - records what worker 1 sends it
     private RecordingWorkerRemote neighbourThree; // id 3 - records what worker 1 sends it
 
     @BeforeAll
+    // Only the fan-out test needs real stubs; the rest run entirely in-process.
     static void startRegistry() throws RemoteException {
         registry = LocateRegistry.createRegistry(TEST_RMI_PORT);
     }
@@ -74,6 +67,7 @@ class WorkerStartElectionTest {
         unexportQuietly(neighbourThree);
     }
 
+    // Each construct exports over RMI, so release them even when a test made none.
     private void unexportQuietly(Remote remoteObject) {
         if (remoteObject == null) {
             return;
@@ -85,20 +79,15 @@ class WorkerStartElectionTest {
         }
     }
 
-    /**
-     * Gives a worker a starting Job Allocation Counter.
-     *
-     * Reflection is used deliberately: there is no public way to arrange JAC
-     * values yet, and driving it through assignTask() would tie this test to
-     * wherever that increment currently lives - which is exactly the thing that
-     * is expected to move. Replace this helper once a proper seam exists.
-     */
+    // Seeds a JAC by reflection: no public seam exists, and assignTask() does not
+    // move the counter. Replace this once the increment has a proper seam.
     private static void seedJobAllocationCounter(WorkerRemoteImpl worker, int value) throws Exception {
         Field field = WorkerRemoteImpl.class.getDeclaredField("jobAllocationCounter");
         field.setAccessible(true);
         ((AtomicInteger) field.get(worker)).set(value);
     }
 
+    // Reads the audit set: an initiator that skips its own id re-processes cycles.
     private static Set<Long> seenMessageIds(WorkerRemoteImpl worker) throws Exception {
         Field field = WorkerRemoteImpl.class.getDeclaredField("seenMessageIds");
         field.setAccessible(true);
@@ -108,19 +97,15 @@ class WorkerStartElectionTest {
     }
 
     @SuppressWarnings("unchecked")
+    // Reads the live election map, so the seeded wave state can be inspected.
     private static Map<Long, Object> electionsOf(WorkerRemoteImpl worker) throws Exception {
         Field field = WorkerRemoteImpl.class.getDeclaredField("elections");
         field.setAccessible(true);
         return (Map<Long, Object>) field.get(worker);
     }
 
-    /**
-     * Reads one int off an ElectionState.
-     *
-     * ElectionState is a private nested class, so the field is looked up on the
-     * value's own runtime class. This is inspection only - nothing here is used
-     * to arrange state for the code under test.
-     */
+    // ElectionState is a private nested class, so the field is found on the value's
+    // own runtime class. Inspection only; nothing here arranges state for the worker.
     private static int readElectionInt(Object electionState, String fieldName) throws Exception {
         Field field = electionState.getClass().getDeclaredField(fieldName);
         field.setAccessible(true);
@@ -128,6 +113,7 @@ class WorkerStartElectionTest {
     }
 
     @Test
+    // No neighbours means nothing to wait for, so the wave must resolve to self at once.
     void aLoneWorkerWithNoNeighboursElectsItself() throws Exception {
         worker = new WorkerRemoteImpl(7);
 
@@ -139,10 +125,12 @@ class WorkerStartElectionTest {
     }
 
     @Test
+    // Ids come from a counter; a repeat would be dropped as a duplicate elsewhere.
     void everyElectionGetsItsOwnMessageId() throws Exception {
         worker = new WorkerRemoteImpl(7);
 
         Set<Long> ids = new HashSet<>();
+        // Sequential here: the uniqueness claim is per-worker, not across threads.
         for (int i = 0; i < RAPID_ELECTIONS; i++) {
             ids.add(worker.startElection());
         }
@@ -153,6 +141,7 @@ class WorkerStartElectionTest {
     }
 
     @Test
+    // Two workers can hold the same wave at once, so their ids must not collide.
     void differentWorkersGenerateDifferentElectionIds() throws Exception {
         worker = new WorkerRemoteImpl(4);
         otherWorker = new WorkerRemoteImpl(5);
@@ -167,10 +156,12 @@ class WorkerStartElectionTest {
     }
 
     @Test
+    // The initiator seeds itself as parent and best candidate, or nobody declares.
     void startElectionInitializesElectionState() throws Exception {
         int initiatorId = 7;
         int startingJac = 3;
         worker = new WorkerRemoteImpl(initiatorId);
+        // Non-zero JAC, so a hardcoded zero in the seed would be caught here.
         seedJobAllocationCounter(worker, startingJac);
 
         long messageId = worker.startElection();
@@ -196,11 +187,13 @@ class WorkerStartElectionTest {
     }
 
     @Test
+    // Fan-out over real RMI stubs: did each neighbour actually receive the wave?
     void startElectionSendsElectionToEveryNeighbour() throws Exception {
         worker = new WorkerRemoteImpl(1);
         neighbourTwo = new RecordingWorkerRemote(2);
         neighbourThree = new RecordingWorkerRemote(3);
 
+        // Rebinding gives each double a registry name, which is how stubs are found.
         registry.rebind("Worker2", neighbourTwo);
         registry.rebind("Worker3", neighbourThree);
 

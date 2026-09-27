@@ -21,29 +21,24 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-/**
- * Step 6 of the worker test plan: receiveCoordinatorMessage().
- *
- * Once the winner is known it must reach EVERY reachable worker, not just the
- * initiator's immediate neighbours - so a received COORDINATOR message is
- * relayed onward. Three things have to hold:
- *
- *   - the relay reaches workers more than one hop away,
- *   - a repeat of the same COORDINATOR message is not relayed again, otherwise
- *     the announcement keeps bouncing around the network, and
- *   - a LATER announcement is still processed, since a new election term has to
- *     replace the coordinator the network already believes in.
- */
+// Coordinator-announcement handling: once a winner is known, every reachable
+// worker must hear about it, not just the initiator's immediate neighbours.
+// A repeat of the same announcement must not be re-flooded, or it circles the
+// network forever; a later announcement with a new id must still be applied, or
+// a new term can never replace the leader the network already believes in.
 class WorkerCoordinatorMessageTest {
 
+    // Ports are unique per class, so the suites can run side by side.
     private static final int TEST_RMI_PORT = 19805;
     private static final String HOST = "localhost";
     private static final long MESSAGE_ID = 300L;
     private static final long SECOND_TERM_MESSAGE_ID = 301L;
     private static final long AWAIT_TIMEOUT_MS = 5_000;
 
+    // Shared by every test here, created once so none pays registry startup.
     private static Registry registry;
 
+    // The three workers take whatever topology each test connects up.
     private WorkerRemoteImpl one;
     private WorkerRemoteImpl two;
     private WorkerRemoteImpl three;
@@ -66,6 +61,7 @@ class WorkerCoordinatorMessageTest {
         three = new WorkerRemoteImpl(3);
         recorder = new RecordingWorkerRemote(9);
 
+        // Binding is how one worker becomes reachable from another by name lookup.
         registry.rebind("Worker1", one);
         registry.rebind("Worker2", two);
         registry.rebind("Worker3", three);
@@ -83,6 +79,7 @@ class WorkerCoordinatorMessageTest {
         unexportQuietly(recorder);
     }
 
+    // RMI export is a side effect of construction, so every test unexports its doubles.
     private void unexportQuietly(Remote remoteObject) {
         if (remoteObject == null) {
             return;
@@ -94,14 +91,17 @@ class WorkerCoordinatorMessageTest {
         }
     }
 
+    // Edges are added one at a time, so each test states its own topology explicitly.
     private void connect(WorkerRemoteImpl from, int toId) throws Exception {
         from.connectAsNeighbour(toId, HOST, TEST_RMI_PORT);
     }
 
+    // Relays are counted by log prefix, so a bounce shows up as one extra entry.
     private static long countOf(List<String> calls, String prefix) {
         return calls.stream().filter(call -> call.startsWith(prefix)).count();
     }
 
+    // Relaying is asynchronous, so convergence is polled rather than assumed on return.
     private void awaitCoordinatorOnAll(int expectedCoordinatorId) throws Exception {
         long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
 
@@ -133,6 +133,7 @@ class WorkerCoordinatorMessageTest {
     }
 
     @Test
+    // Regression: a repeat of the same message id must be dropped, not re-flooded.
     void aRepeatedCoordinatorMessageIsNotRelayedAgain() throws Exception {
         connect(one, 9);
 
@@ -145,6 +146,7 @@ class WorkerCoordinatorMessageTest {
     }
 
     @Test
+    // A new term must supersede the old leader, or jobs keep going to a stale coordinator.
     void aDifferentCoordinatorMessageIdIsProcessedAsANewAnnouncement() throws Exception {
         connect(one, 9);
 
@@ -172,10 +174,8 @@ class WorkerCoordinatorMessageTest {
 
     @Test
     void coordinatorMessageConvergesAcrossACyclicTopology() throws Exception {
-        // A triangle: 1-2, 2-3, 3-1. Unlike the line above, this topology
-        // contains a cycle, so the announcement can come back to a node that has
-        // already sent it. That only terminates because a COORDINATOR message
-        // is relayed once and then suppressed everywhere it has been seen.
+        // A triangle, so the announcement can return to a node that already sent it; it only
+        // terminates because each message id is relayed once and suppressed after first sight.
         connect(one, 2);
         connect(two, 1);
         connect(two, 3);
@@ -186,6 +186,7 @@ class WorkerCoordinatorMessageTest {
         // The call has to be bounded as well as the wait below: an unsuppressed
         // relay in a cycle means this call never returns, so it runs on its own
         // thread and fails the test instead of hanging the whole run.
+        // An unsuppressed relay never returns, so bound the call as well as the wait.
         assertTimeoutPreemptively(Duration.ofMillis(AWAIT_TIMEOUT_MS), () ->
                 one.receiveCoordinatorMessage(3, MESSAGE_ID));
 

@@ -11,19 +11,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cs324.worker.WorkerRemoteImpl;
 
-/**
- * WorkerRemoteImpl extends UnicastRemoteObject, so constructing it exports
- * it via RMI on an anonymous port as a side effect. These tests call its
- * methods directly (no registry lookup needed - it's just a local object
- * reference within the same JVM), but still need to unexport it afterward
- * so repeated test runs don't leak RMI resources.
- */
+// Extending UnicastRemoteObject means the constructor exports the worker over
+// RMI, so each test unexports it to keep repeated runs from leaking endpoints.
 class WorkerRemoteImplTest {
 
+    // The worker each test drives directly, so no registry lookup is needed.
     private WorkerRemoteImpl worker;
 
     @AfterEach
     void tearDown() {
+        // A test that failed early may never have built one.
         if (worker != null) {
             try {
                 UnicastRemoteObject.unexportObject(worker, true);
@@ -34,6 +31,7 @@ class WorkerRemoteImplTest {
     }
 
     @Test
+    // A fresh announcement id is new work, so the recorded coordinator must change.
     void newCoordinatorMessageUpdatesCurrentCoordinator() throws Exception {
         worker = new WorkerRemoteImpl(5);
 
@@ -44,12 +42,12 @@ class WorkerRemoteImplTest {
     }
 
     @Test
+    // The id is the dedup key: a repeat carrying a different leader must still be dropped.
     void duplicateCoordinatorMessageIsIgnoredEvenWithADifferentCoordinatorId() throws Exception {
         worker = new WorkerRemoteImpl(5);
         worker.receiveCoordinatorMessage(7, 100L);
 
-        // same messageId as before, but claiming a DIFFERENT coordinator -
-        // this should be dropped as a duplicate, not applied
+        // Same messageId as before but a different coordinator: a duplicate, so drop it.
         worker.receiveCoordinatorMessage(99, 100L);
 
         assertEquals(7, worker.getCurrentCoordinatorId(),
@@ -57,14 +55,13 @@ class WorkerRemoteImplTest {
     }
 
     @Test
+    // Dropping a duplicate must not poison later ids - a new term still has to get through.
     void aGenuinelyNewMessageIdStillUpdatesAfterAnEarlierDuplicateWasIgnored() throws Exception {
         worker = new WorkerRemoteImpl(5);
         worker.receiveCoordinatorMessage(7, 100L);
         worker.receiveCoordinatorMessage(99, 100L); // ignored duplicate
 
-        // a different messageId entirely - this is a legitimately new
-        // COORDINATOR announcement (e.g. after a new term/election) and
-        // should be applied normally
+        // A different id entirely: a legitimately new announcement, applied normally.
         worker.receiveCoordinatorMessage(3, 101L);
 
         assertEquals(3, worker.getCurrentCoordinatorId(),
@@ -79,13 +76,13 @@ class WorkerRemoteImplTest {
         assertEquals(-1, worker.getCurrentCoordinatorId(),
                 "a worker that has seen no COORDINATOR message must not claim to know a coordinator");
 
-        // The election rule compares JAC values, so the starting point matters:
-        // every worker must begin from the same baseline of zero assignments.
+        // The election compares JAC, so an unstarted worker must report a zero baseline.
         assertEquals(0, worker.getJobAllocationCounter(),
                 "a worker that has coordinated nothing should start with a Job Allocation Counter of zero");
     }
 
     @Test
+    // Discovery polls isActive(), so a running worker must advertise itself.
     void aFreshWorkerReportsItselfActive() throws Exception {
         worker = new WorkerRemoteImpl(4);
 

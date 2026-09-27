@@ -24,14 +24,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BootstrapRegistryImplTest {
 
-    // Fixed test port. If your test environment already has something bound
-    // here, change this to a free port on your machine.
+    // Fixed test port; change it if your machine already has something bound here.
     private static final int TEST_RMI_PORT = 19999;
 
-    // Created once for the whole test class, not per test. Recreating an RMI
-    // registry on the same port between individual tests is flaky - the OS
-    // doesn't always release the port instantly after unexporting, causing
-    // "Address already in use" on the very next test.
+    // One registry for the whole class: recreating it between tests races the port release.
+    // Unbinding names between tests avoids that without giving up the shared registry.
     private static Registry registry;
 
     private BootstrapRegistryImpl bootstrap;
@@ -53,8 +50,7 @@ class BootstrapRegistryImplTest {
 
     @AfterEach
     void tearDown() throws Exception {
-        // Unbind anything this test registered, so names don't leak into
-        // the next test that shares the same registry.
+        // Unbind every name, so bindings do not leak into the next test sharing this registry.
         for (String name : registry.list()) {
             registry.unbind(name);
         }
@@ -69,6 +65,7 @@ class BootstrapRegistryImplTest {
         }
     }
 
+    // The very first worker has nobody to introduce, but must still be recorded.
     @Test
     void firstWorkerToRegisterGetsNullPeer() throws RemoteException {
         WorkerRemote peer = bootstrap.registerWorker(1, "localhost", TEST_RMI_PORT);
@@ -79,8 +76,7 @@ class BootstrapRegistryImplTest {
 
     @Test
     void secondWorkerToRegisterGetsFirstWorkerAsPeer() throws Exception {
-        // Worker 1 registers first and binds itself for real, so the
-        // Bootstrap Node has something live to look up later.
+        // Worker 1 is bound for real, so the directory can hand its stub to the newcomer.
         FakeWorkerRemote worker1 = new FakeWorkerRemote(1);
         registry.rebind("Worker1", worker1);
         bootstrap.registerWorker(1, "localhost", TEST_RMI_PORT);
@@ -95,57 +91,60 @@ class BootstrapRegistryImplTest {
         unexportQuietly(worker1);
     }
 
+    // A fresh directory has nothing to report until something registers.
         @Test
     void getActiveWorkerIdsIsEmptyWhenNoneRegistered() throws RemoteException {
         assertTrue(bootstrap.getActiveWorkerIds().isEmpty(), "a fresh Bootstrap Node should have no active workers yet");
     }
- 
+
+    // The active list is the directory's view of the network, not just the bound names.
     @Test
     void getActiveWorkerIdsReflectsAllRegisteredWorkers() throws Exception {
         FakeWorkerRemote worker1 = new FakeWorkerRemote(1);
         registry.rebind("Worker1", worker1);
         bootstrap.registerWorker(1, "localhost", TEST_RMI_PORT);
         bootstrap.registerWorker(2, "localhost", TEST_RMI_PORT);
- 
+
         List<Integer> activeIds = bootstrap.getActiveWorkerIds();
- 
+
         assertEquals(2, activeIds.size(), "both registered workers should be reflected");
         assertTrue(activeIds.contains(1), "worker 1 should be in the active list");
         assertTrue(activeIds.contains(2), "worker 2 should be in the active list");
- 
+
         unexportQuietly(worker1);
     }
- 
+
+    // Deregistration must drop a worker without disturbing the others.
     @Test
     void getActiveWorkerIdsExcludesDeregisteredWorkers() throws Exception {
         FakeWorkerRemote worker1 = new FakeWorkerRemote(1);
         registry.rebind("Worker1", worker1);
         bootstrap.registerWorker(1, "localhost", TEST_RMI_PORT);
         bootstrap.registerWorker(2, "localhost", TEST_RMI_PORT);
- 
+
         bootstrap.deregisterWorker(1);
         List<Integer> activeIds = bootstrap.getActiveWorkerIds();
- 
+
         assertEquals(1, activeIds.size(), "only the non-deregistered worker should remain");
         assertTrue(activeIds.contains(2), "worker 2 should still be active");
- 
+
         unexportQuietly(worker1);
     }
 
+    // The removal path: the id must be gone from the active list afterwards.
     @Test
     void deregisterWorkerRemovesAnExistingWorker() throws RemoteException {
         bootstrap.registerWorker(1, "localhost", TEST_RMI_PORT);
         assertEquals(1, bootstrap.getActiveWorkerIds().size(), "worker should be registered before deregistering it");
- 
+
         bootstrap.deregisterWorker(1);
- 
+
         assertTrue(bootstrap.getActiveWorkerIds().isEmpty(), "the worker should no longer be active after deregistering");
     }
- 
+
     @Test
     void deregisteringAnUnknownWorkerDoesNotThrow() {
-        // 42 was never registered. Map.remove() on a missing key is a no-op,
-        // so this should complete quietly rather than error out.
+        // Map.remove() on a missing key is a no-op, so this must complete quietly.
         assertDoesNotThrow(() -> bootstrap.deregisterWorker(42),
                 "deregistering an unknown worker id should not throw");
     }

@@ -18,20 +18,10 @@ import java.rmi.server.UnicastRemoteObject;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 
-/**
- * Step 7 of the worker test plan: assignTask().
- *
- * assignTask is deliberately fire-and-return: the coordinator hands over a slice
- * of work and immediately carries on, so the worker computes on a background
- * thread and calls reportTaskResult back on the coordinator when it is done.
- *
- * These tests pin the three calculations the assignment requires (MAX,
- * PRIMESUM over a range, PRIMECOUNT over a list) and prove that the result is
- * actually delivered to the coordinator over RMI.
- *
- * The JAC is deliberately NOT asserted here: JAC counts coordinator-side
- * assignments (see submitJob()) and is covered by WorkerDispatchTest.
- */
+// Step 7 of the worker test plan: assignTask().
+// assignTask is fire-and-return: the worker computes on a pool thread and calls back later.
+// These tests pin the three assignment calculations and prove the result crosses RMI.
+// The JAC is deliberately unasserted here; it counts coordinator-side assignments.
 class WorkerAssignTaskTest {
 
     private static final int TEST_RMI_PORT = 19806;
@@ -40,9 +30,12 @@ class WorkerAssignTaskTest {
     private static final int THIS_WORKER_ID = 1;
     private static final long AWAIT_TIMEOUT_MS = 5_000;
 
+    // Shared across tests; recreating an RMI registry on one port between tests is flaky.
     private static Registry registry;
 
+    // A real worker, so the background compute path under test is the production one.
     private WorkerRemoteImpl worker;
+    // A recording double stands in for the coordinator, so results are observable.
     private RecordingWorkerRemote coordinator;
 
     @BeforeAll
@@ -62,8 +55,7 @@ class WorkerAssignTaskTest {
 
         registry.rebind("Worker" + COORDINATOR_ID, coordinator);
 
-        // Make the recording peer this worker's neighbour AND its coordinator, so
-        // the completion callback has somewhere real to go.
+        // Peer and coordinator are the same stub, so the callback has a live target.
         worker.connectAsNeighbour(COORDINATOR_ID, HOST, TEST_RMI_PORT);
         worker.receiveCoordinatorMessage(COORDINATOR_ID, 1L);
     }
@@ -88,8 +80,9 @@ class WorkerAssignTaskTest {
         }
     }
 
-    /** Waits for the background computation to report back, and returns the value. */
+    // Polls the double until the callback lands, because the compute runs on another thread.
     private String awaitReportedResult(int jobId) throws Exception {
+        // A deadline rather than a join, because the work was handed to another thread.
         long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
 
         while (System.currentTimeMillis() < deadline) {
@@ -129,6 +122,7 @@ class WorkerAssignTaskTest {
                 "PRIMECOUNT(2, 8, 7, 4, 11, 10) sees 2, 7 and 11");
     }
 
+    // Regression: a two-element payload is data, never a range to iterate.
     @Test
     void maxTreatsTwoNumbersAsDataNotAsARange() throws Exception {
         worker.assignTask(4, "MAX", new int[]{5, 3});
@@ -140,20 +134,15 @@ class WorkerAssignTaskTest {
 
     @Test
     void completedTasksAreNotLeftCountedAsActive() throws Exception {
-        // A leak guard, not a reproduction of the ordering that motivates it.
-        // assignTask records the running task just after submitting it, so a task
-        // that finished first would remove nothing and strand its entry. That
-        // interleaving is hard to force on purpose: the pool thread would have to
-        // wake up and finish before the submitting thread executes its next
-        // statement, which in practice it does not. So this pins the guarantee that
-        // actually matters - the active-task count tracks real work and returns to
-        // zero - which is exactly what a stranded entry would break.
+        // A leak guard, not a reproduction: the racy interleaving is impractical to force.
+        // A task that finished before it was recorded would strand its active entry.
         final int jobs = 50;
         for (int job = 1; job <= jobs; job++) {
             worker.assignTask(1000 + job, "MAX", new int[]{job, job + 1});
             awaitReportedResult(1000 + job);
         }
 
+        // The count settles asynchronously, so poll instead of reading it once.
         long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
         while (System.currentTimeMillis() < deadline && worker.getActiveTaskCount() != 0) {
             Thread.sleep(20);

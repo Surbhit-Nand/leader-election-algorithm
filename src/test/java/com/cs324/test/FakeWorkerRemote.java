@@ -5,12 +5,8 @@ import com.cs324.common.WorkerRemote;
 import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
 
-/**
- * Test double for WorkerRemote.
- * Only getId() actually matters for these tests — every other method
- * is a no-op stub, just enough to satisfy the interface so this can be
- * bound in a real RMI registry and looked up by BootstrapRegistryImpl.
- */
+// Silent test double for WorkerRemote: only getId() carries meaning, the rest are no-ops.
+// Implemented in full so it can be bound in a real RMI registry and looked up by name.
 public class FakeWorkerRemote extends UnicastRemoteObject implements WorkerRemote {
 
     private final int id;

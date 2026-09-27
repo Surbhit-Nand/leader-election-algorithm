@@ -4,25 +4,23 @@ import java.rmi.Remote;
 import java.rmi.RemoteException;
 import java.util.List;
 
-/**
- * RMI contract for the Bootstrap Node.
- * Tracks registered active workers only - does not join elections or jobs.
- */
+// RMI contract for the Bootstrap Node: an active-worker directory, never a participant.
 public interface BootstrapRemote extends Remote {
 
+    // A worker registers and is returned one active peer to join, or null if it is first.
     // A worker registers itself and is returned an existing active worker
-    // to randomly connect to (or null if it is the first node).
     WorkerRemote registerWorker(int workerId, String rmiHost, int rmiPort) throws RemoteException;
 
+    // Fired on clean shutdown, so the directory stops handing out dead workers.
     void deregisterWorker(int workerId) throws RemoteException;
 
     // Shared IDs keep jobs from different clients separate. No computation happens here.
     int allocateJobId() throws RemoteException;
 
+    // Lets a coordinator reach every worker, not only its own neighbours.
     List<Integer> getActiveWorkerIds() throws RemoteException;
 
+    // Address lookup so a joiner can reach the peer stub it was handed; null if unknown.
     // Address lookup so a joining worker can connect to the peer stub
-    // it was handed (needed for bidirectional neighbour setup on localhost
-    // and multi-host demos). Returns null if unknown.
     com.cs324.common.WorkerAddress getWorkerAddress(int workerId) throws RemoteException;
 }
