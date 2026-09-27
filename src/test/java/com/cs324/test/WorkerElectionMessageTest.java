@@ -14,6 +14,7 @@ import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -171,5 +172,68 @@ class WorkerElectionMessageTest {
         } finally {
             unexportQuietly(leaf);
         }
+    }
+
+    @Test
+    void copiesArrivingAtTheSameInstantAreForwardedOnceAndAnsweredOnce() throws Exception {
+        // Two copies of one wave, released together, so one of them lands while the
+        // other is still being processed. Claiming the id before publishing the
+        // wave used to leave that second copy with no state to answer from, and the
+        // node that sent it waited for an echo that never came. The window is only
+        // microseconds wide, so this hammers it rather than trying to place a
+        // single delivery inside it on purpose.
+        final int attempts = 300;
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            final long messageId = 900L + attempt;
+            CountDownLatch fire = new CountDownLatch(1);
+
+            Thread fromSender = new Thread(() -> deliverElection(fire, 2, messageId), "copy-from-2");
+            Thread fromOther = new Thread(() -> deliverElection(fire, 3, messageId), "copy-from-3");
+            fromSender.start();
+            fromOther.start();
+            fire.countDown();
+            fromSender.join(5_000);
+            fromOther.join(5_000);
+
+            // Which copy is processed first is not deterministic, so the invariant
+            // is counted across both neighbours rather than per neighbour: the wave
+            // goes out once, and the copy that lost the race is answered once.
+            assertEquals(1L, deliveriesFor("election|", messageId),
+                    "attempt " + attempt + ": the wave must be forwarded exactly once however many copies "
+                            + "arrived; recorded: " + sender.calls() + " / " + other.calls());
+            assertEquals(1L, deliveriesFor("echo|", messageId),
+                    "attempt " + attempt + ": the copy that lost the race must still be answered, or the "
+                            + "neighbour that sent it waits forever; recorded: " + sender.calls() + " / "
+                            + other.calls());
+        }
+    }
+
+    /** Delivers one copy of an election, waiting on the gate so copies race. */
+    private void deliverElection(CountDownLatch fire, int fromWorkerId, long messageId) {
+        try {
+            fire.await();
+            worker.receiveElectionMessage(fromWorkerId, fromWorkerId, 0, messageId);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (RemoteException failure) {
+            throw new IllegalStateException(failure);
+        }
+    }
+
+    /** How many times the given prefix was recorded for one message, across both neighbours. */
+    private long deliveriesFor(String prefix, long messageId) {
+        String suffix = "|" + messageId;
+        long count = 0;
+        for (String call : sender.calls()) {
+            if (call.startsWith(prefix) && call.endsWith(suffix)) {
+                count++;
+            }
+        }
+        for (String call : other.calls()) {
+            if (call.startsWith(prefix) && call.endsWith(suffix)) {
+                count++;
+            }
+        }
+        return count;
     }
 }

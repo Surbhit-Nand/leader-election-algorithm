@@ -137,4 +137,30 @@ class WorkerAssignTaskTest {
                 "a two element MAX payload is still just two numbers - reading it as a range 5..3 would "
                         + "produce an empty list and a nonsense answer");
     }
+
+    @Test
+    void completedTasksAreNotLeftCountedAsActive() throws Exception {
+        // A leak guard, not a reproduction of the ordering that motivates it.
+        // assignTask records the running task just after submitting it, so a task
+        // that finished first would remove nothing and strand its entry. That
+        // interleaving is hard to force on purpose: the pool thread would have to
+        // wake up and finish before the submitting thread executes its next
+        // statement, which in practice it does not. So this pins the guarantee that
+        // actually matters - the active-task count tracks real work and returns to
+        // zero - which is exactly what a stranded entry would break.
+        final int jobs = 50;
+        for (int job = 1; job <= jobs; job++) {
+            worker.assignTask(1000 + job, "MAX", new int[]{job, job + 1});
+            awaitReportedResult(1000 + job);
+        }
+
+        long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline && worker.getActiveTaskCount() != 0) {
+            Thread.sleep(20);
+        }
+
+        assertEquals(0, worker.getActiveTaskCount(),
+                jobs + " tasks have all reported their results, so none of them may still be listed as "
+                        + "running; a task that finished before it was recorded leaves its entry behind");
+    }
 }

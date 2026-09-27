@@ -19,7 +19,6 @@ import java.util.HashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
@@ -102,7 +101,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     // Job IDs are assumed unique per job; a repeated jobId is treated as a retry and suppressed.
     private final Set<Integer> seenJobIds = ConcurrentHashMap.newKeySet();
     // In-flight tasks for lifecycle observability (not used for locking).
-    private final Map<Integer, Future<?>> activeTasks = new ConcurrentHashMap<>();
+    private final Set<Integer> activeTasks = ConcurrentHashMap.newKeySet();
 
     // ---- Coordinator job dispatch (client jobs) ----
     // A submitted job is split across the coordinator and its neighbours; the
@@ -219,22 +218,9 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
     @Override
     public void receiveElectionMessage(int originId, int candidateId, int candidateJac, long messageId) throws RemoteException {
-        // Duplicate check: add() returns false if already seen.
-        if (!seenMessageIds.add(messageId)) {
-            // Already seen: look up the wave.
-            ElectionState existing = elections.get(messageId);
-            if (existing != null) {
-                try {
-                    // Find who sent it.
-                    WorkerRemote sender = neighbours.get(originId);
-                    if (sender != null) {
-                        // Answer the duplicate with our current best so the sender can finish.
-                        sender.receiveEchoMessage(messageId, this.id, existing.bestCandidateId, existing.bestCandidateJac);
-                    }
-                } catch (RemoteException ignored) {}
-            }
-            return;
-        }
+        // Record the id as seen. This set is a record only: the duplicate guard
+        // is the elections.compute() below, NOT this set.
+        seenMessageIds.add(messageId);
 
         // Read our JAC for comparison.
         int currentJac = jobAllocationCounter.get();
@@ -254,18 +240,59 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
             }
         }
 
-        // Track this wave with us remembering who sent it (parent).
-        ElectionState election = new ElectionState(originId, bestId, bestJac);
+        // The comparison above reassigns these, so the lambda needs its own copy.
+        final int ourBestId = bestId;
+        final int ourBestJac = bestJac;
+        final int parentId = originId;
 
-        // Expect replies from all neighbours except the parent.
-        for (Integer neighborId : neighbours.keySet()) {
-            if (neighborId != originId) {
-                election.pendingChildren.add(neighborId);
+        // Claim the wave and publish its state in one atomic map operation.
+        // A separate put() left a gap in which a duplicate, or an echo from an
+        // already-forwarded child, saw the id as seen but found no state and was
+        // dropped - and a dropped echo strands that child in the parent's
+        // pendingChildren forever, deadlocking a wave that contains a cycle.
+        // compute() closes the gap, and running it before any fan-out means no
+        // echo can arrive before there is a state to merge into.
+        final ElectionState[] created = new ElectionState[1];
+        final ElectionState[] alreadySeen = new ElectionState[1];
+        elections.compute(messageId, (key, existing) -> {
+            if (existing != null) {
+                alreadySeen[0] = existing;
+                return existing;
             }
+            // Track this wave with us remembering who sent it (parent).
+            ElectionState election = new ElectionState(parentId, ourBestId, ourBestJac);
+            // Expect replies from all neighbours except the parent.
+            for (Integer neighborId : neighbours.keySet()) {
+                if (neighborId != parentId) {
+                    election.pendingChildren.add(neighborId);
+                }
+            }
+            created[0] = election;
+            return election;
+        });
+
+        ElectionState seen = alreadySeen[0];
+        if (seen != null) {
+            // Already seen: answer the duplicate with our current best so the
+            // sender can finish. Read under the monitor, because that is where
+            // receiveEchoMessage merges candidates into it.
+            int[] best = new int[2];
+            synchronized (seen) {
+                best[0] = seen.bestCandidateId;
+                best[1] = seen.bestCandidateJac;
+            }
+            try {
+                // Find who sent it.
+                WorkerRemote sender = neighbours.get(parentId);
+                if (sender != null) {
+                    // Answer the duplicate with our current best so the sender can finish.
+                    sender.receiveEchoMessage(messageId, this.id, best[0], best[1]);
+                }
+            } catch (RemoteException ignored) {}
+            return;
         }
 
-        // Publish the wave.
-        elections.put(messageId, election);
+        ElectionState election = created[0];
 
         // Snapshot so concurrent neighbour changes mid-wave cannot corrupt fan-out.
         // Copy of neighbours.
@@ -274,7 +301,7 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         for (Map.Entry<Integer, WorkerRemote> entry : snapshot) {
             if (entry.getKey() != originId) {
                 try {
-                    entry.getValue().receiveElectionMessage(this.id, bestId, bestJac, messageId);
+                    entry.getValue().receiveElectionMessage(this.id, ourBestId, ourBestJac, messageId);
                 } catch (RemoteException e) {
                     // Dead peer: stop waiting for it.
                     election.pendingChildren.remove(entry.getKey());
@@ -422,9 +449,17 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
 
         // Copy jobType for the background thread.
         final String typeSnapshot = jobType;
+        // Count the task as active BEFORE handing it to the pool.
+        // Recording it afterwards races the task's own cleanup: the pool thread
+        // can finish first, its removal finds nothing to remove, and the entry
+        // added afterwards is stranded - leaving getActiveTaskCount()
+        // over-reporting for good and inflating the JAC this node advertises in
+        // elections. Claiming it first means the task's removal always finds
+        // something to remove; the rejection handler below removes it too.
+        activeTasks.add(jobId);
         try {
             // Run the computation on a pool thread so this RMI call returns instantly.
-            Future<?> future = executor.submit(() -> {
+            executor.submit(() -> {
                 // Holder for the answer.
                 Object computedResult;
                 try {
@@ -462,8 +497,6 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
                     activeTasks.remove(jobId);
                 }
             });
-            // Track the running task.
-            activeTasks.put(jobId, future);
         } catch (RejectedExecutionException e) {
             // Pool shut down / saturated: release the claim so a retry can be accepted later.
             // Forget the tracking entry.
@@ -523,10 +556,14 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         List<Object> chunks = splitPayload(jobType, payload, participants.size());
         if (!submittedJobIds.add(jobId)) return;
 
-        // This job counts against the current term. Incrementing here, after the
-        // duplicate guard, means an accepted job is counted exactly once and
-        // only while this node is the coordinator.
-        termJobsCoordinated.incrementAndGet();
+        // This job counts against the current term. Reserving here, after the
+        // duplicate guard, means an accepted job is counted exactly once.
+        // The reservation never writes a value above JOBS_PER_TERM, because
+        // maybeRotateCoordinator() resets the counter concurrently: with an
+        // increment-then-check scheme a request can observe 6, the reset can
+        // land in between, and the late undo would drive the counter to -1 -
+        // after which no term would ever reach its limit again.
+        final boolean termExhausted = reserveTermSlot(jobId);
 
         // Register the entire job before any thread can report a result.
         Set<Integer> expected = ConcurrentHashMap.newKeySet();
@@ -598,6 +635,32 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
         state.dispatchComplete().set(true);
         finishJobIfReady(jobId, state);
+        if (termExhausted) {
+            maybeRotateCoordinator();
+        }
+    }
+
+    /**
+     * Claims one job slot in the current term, rejecting once it is full.
+     *
+     * <p>Returns whether the caller filled the term and so has to hand over
+     * leadership. A full term refuses the job rather than queueing it, so "at
+     * most JOBS_PER_TERM jobs" holds under concurrent submissions. A refused job
+     * gives its id back, so a client retry against the new coordinator is not
+     * mistaken for a duplicate.
+     */
+    private boolean reserveTermSlot(int jobId) throws RemoteException {
+        while (true) {
+            int used = termJobsCoordinated.get();
+            if (used >= Constants.JOBS_PER_TERM) {
+                submittedJobIds.remove(jobId);
+                throw new RemoteException("Worker " + id + " has coordinated the maximum of "
+                        + Constants.JOBS_PER_TERM + " jobs for this term; it is handing over leadership");
+            }
+            if (termJobsCoordinated.compareAndSet(used, used + 1)) {
+                return used + 1 == Constants.JOBS_PER_TERM;
+            }
+        }
     }
 
     private Map<Integer, WorkerRemote> discoverJobWorkers() throws RemoteException {
@@ -667,9 +730,22 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
      * leadership rotates. The counter is per job, not per assignment.
      */
     private void maybeRotateCoordinator() {
-        if (termJobsCoordinated.get() >= Constants.JOBS_PER_TERM) {
-            termJobsCoordinated.set(0);
-            startElection();
+        // Reset the budget and start the election as one step. A plain
+        // get()-then-set() let two threads both observe a full term and both
+        // start an election, and since each election picks its own best
+        // candidate from the JACs it happens to see, two of them can disagree
+        // about the leader. The CAS makes exactly one thread win the reset, so
+        // one term produces exactly one election; a value that is already reset
+        // fails to match, which is the "someone else is rotating" case.
+        while (true) {
+            int used = termJobsCoordinated.get();
+            if (used < Constants.JOBS_PER_TERM) {
+                return;
+            }
+            if (termJobsCoordinated.compareAndSet(used, 0)) {
+                startElection();
+                return;
+            }
         }
     }
 
