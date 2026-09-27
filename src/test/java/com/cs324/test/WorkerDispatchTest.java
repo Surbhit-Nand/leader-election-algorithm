@@ -1,7 +1,6 @@
 package com.cs324.test;
 
-import com.cs324.common.ClientRemote;
-import com.cs324.common.WorkerRemote;
+
 import com.cs324.worker.WorkerRemoteImpl;
 import com.cs324.worker.WorkerTaskCalculator;
 import org.junit.jupiter.api.AfterAll;
@@ -184,12 +183,29 @@ class WorkerDispatchTest {
     }
 
     @Test
+    void coordinatorKeepsLeadingUntilTheFifthJobOfItsTerm() throws Exception {
+        // A term is JOBS_PER_TERM (5) client jobs, not 5 task assignments.
+        // Each job here assigns two slices (to w2 and w3), so the old
+        // per-assignment reading rotated the leader after only 2 jobs.
+        for (int j = 1; j <= 4; j++) {
+            w1.submitJob(200 + j, "MAX", new int[]{j, j + 7, 42}, HOST, TEST_RMI_PORT, CLIENT_NAME);
+            awaitResult(200 + j);
+        }
+
+        assertEquals(1, w1.getCurrentCoordinatorId(),
+                "the coordinator must still be leading during its first four jobs of the term");
+        assertEquals(4, w1.getJobsCoordinatedInTerm(),
+                "each accepted job counts once against the term, regardless of how many workers it is split across");
+        assertEquals(8, w1.getJobAllocationCounter(),
+                "the JAC still counts every assignment issued to another worker");
+    }
+
+    @Test
     void coordinatorRotatesAfterItsTermTrigger() throws Exception {
-        // Each job assigns slices to workers 2 and 3: TWO JAC increments per job.
-        // All workers start at JAC 0, so after the third job the coordinator hits
-        // JAC 6 >= JOBS_PER_TERM(5) and must start a fresh election. With w1 now
-        // on JAC 6 and w2/w3 still on 0, the lowest-JAC tie-break picks worker 3.
-        for (int j = 1; j <= 3; j++) {
+        // A term is JOBS_PER_TERM (5) client jobs. All workers start at JAC 0, so
+        // after the fifth job the coordinator holds JAC 10 while w2/w3 are still
+        // on 0, and the lowest-JAC tie-break hands leadership to worker 3.
+        for (int j = 1; j <= 5; j++) {
             w1.submitJob(100 + j, "MAX", new int[]{j, j + 7, 42}, HOST, TEST_RMI_PORT, CLIENT_NAME);
             awaitResult(100 + j);
         }
@@ -203,9 +219,9 @@ class WorkerDispatchTest {
         }
 
         assertEquals(3, w1.getCurrentCoordinatorId(),
-                "after JOBS_PER_TERM assignments the coordinator must rotate to the "
+                "after JOBS_PER_TERM client jobs the coordinator must rotate to the "
                         + "lowest-JAC worker (w3), got coordinator=" + w1.getCurrentCoordinatorId());
-        assertEquals(6, w1.getJobAllocationCounter(),
+        assertEquals(10, w1.getJobAllocationCounter(),
                 "the departed coordinator keeps the JAC it earned during its term");
     }
 }

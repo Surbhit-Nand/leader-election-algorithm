@@ -129,8 +129,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     // Skip a beat if the previous one is still blocked on a slow coordinator,
     // so a slow peer cannot stack up probes.
     private final AtomicBoolean heartbeatInFlight = new AtomicBoolean(false);
-    // Next JAC threshold at which this coordinator starts a new term's election.
-    private volatile int termTrigger = Constants.JOBS_PER_TERM;
+    // Number of client jobs this worker has coordinated in its current term.
+    // A term lasts Constants.JOBS_PER_TERM client jobs, counted per job rather
+    // than per assignment, so a term's length does not depend on how many
+    // workers the cluster has. Reset whenever this node becomes the coordinator.
+    private final AtomicInteger termJobsCoordinated = new AtomicInteger(0);
 
     public WorkerRemoteImpl(int id) throws RemoteException {
         super();
@@ -155,6 +158,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     /** Local helper for the WorkerNode console menu (not part of the RMI contract). */
     public Set<Integer> getNeighbourIds() {
         return Set.copyOf(neighbours.keySet());
+    }
+
+    /** Client jobs coordinated in the current term; a term ends at JOBS_PER_TERM. */
+    public int getJobsCoordinatedInTerm() {
+        return termJobsCoordinated.get();
     }
 
     @Override
@@ -288,6 +296,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         }
         // Record the winner. Volatile write = all threads see it at once.
         this.currentCoordinatorId = coordinatorId;
+        // A new term begins whenever this node is named coordinator, so the
+        // job budget restarts rather than carrying over from an earlier term.
+        if (coordinatorId == this.id) {
+            termJobsCoordinated.set(0);
+        }
 
         // Snapshot: relay runs on the calling RMI thread against a stable view.
         // Copy of neighbours.
@@ -346,6 +359,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         if (election.parentId == this.id) {
             // Save the winner locally.
             this.currentCoordinatorId = election.bestCandidateId;
+            // Re-electing ourselves (a lone worker, or one whose peers all left)
+            // is a fresh term, so the job budget restarts.
+            if (election.bestCandidateId == this.id) {
+                termJobsCoordinated.set(0);
+            }
             // Coordinator announcement ID derived from the election ID.
             long coordMessageId = messageId + 1000000L;
             // Snapshot of neighbours for the broadcast.
@@ -505,6 +523,11 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
         List<Object> chunks = splitPayload(jobType, payload, participants.size());
         if (!submittedJobIds.add(jobId)) return;
 
+        // This job counts against the current term. Incrementing here, after the
+        // duplicate guard, means an accepted job is counted exactly once and
+        // only while this node is the coordinator.
+        termJobsCoordinated.incrementAndGet();
+
         // Register the entire job before any thread can report a result.
         Set<Integer> expected = ConcurrentHashMap.newKeySet();
         for (int i = 0; i < participants.size(); i++) {
@@ -639,12 +662,13 @@ public class WorkerRemoteImpl extends UnicastRemoteObject implements WorkerRemot
     }
 
     /**
-     * Term expiry: after JOBS_PER_TERM assignments the coordinator yields by
-     * starting a new election; the lowest-JAC worker wins and leadership rotates.
+     * Term expiry: after Constants.JOBS_PER_TERM client jobs the coordinator
+     * yields by starting a new election; the lowest-JAC worker wins and
+     * leadership rotates. The counter is per job, not per assignment.
      */
     private void maybeRotateCoordinator() {
-        if (jobAllocationCounter.get() >= termTrigger) {
-            termTrigger += Constants.JOBS_PER_TERM;
+        if (termJobsCoordinated.get() >= Constants.JOBS_PER_TERM) {
+            termJobsCoordinated.set(0);
             startElection();
         }
     }

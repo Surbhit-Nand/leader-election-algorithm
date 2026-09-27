@@ -11,7 +11,10 @@ public class Constants {
     // Default RMI registry port; adjust as needed per node
     public static final int DEFAULT_RMI_PORT = 1099;
 
-    // Coordinator serves for a term of 5 job assignments before re-election
+    // A coordinator serves a term of 5 client jobs before yielding to a new
+    // election. The term counts jobs, not task assignments: the Job Allocation
+    // Counter still increments once per assignment (see WorkerRemoteImpl) and
+    // is only the metric candidates are compared on.
     public static final int JOBS_PER_TERM = 5;
 
     // How often workers probe their current coordinator (heartbeat)
